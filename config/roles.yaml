@@ -1,0 +1,15 @@
+roles:
+  planner:   { executor: pi,    account: default, instructions: roles/planner.md,   timeout: 15m, capabilities: [brain] }
+  assistant: { executor: pi,    account: default, instructions: roles/assistant.md, timeout: 30m }
+  designer:  { executor: pi,    account: default, instructions: roles/designer.md,  timeout: 30m }
+  coder:     { executor: codex, account: main,    instructions: roles/coder.md,     timeout: 60m }
+  reviewer:  { executor: codex, account: main,    instructions: roles/reviewer.md,  timeout: 30m }
+  fake:      { executor: fake,  account: default, instructions: roles/fake.md,     timeout: 10m }
+defaultBrain: planner
+limits:
+  globalConcurrency: 4
+  goal: { maxParallel: 2, maxStepsPerRound: 4 }
+  accounts:
+    pi/default: { concurrency: 2 }
+    codex/main: { concurrency: 1 }
+    fake/default: { concurrency: 4 }

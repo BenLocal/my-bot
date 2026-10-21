@@ -1,0 +1,9 @@
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: mybot-config
+spec:
+  observability:
+    enabled: false
+  tracing:
+    sampleRate: 0

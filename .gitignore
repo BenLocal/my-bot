@@ -37,3 +37,7 @@ dev-env.local.md
 
 # P0 核验用的临时程序，不入库（结论写回 docs/spec.md）
 spikes/
+
+# 编译产物
+mybot-runtime
+mybot-worker
