@@ -1,7 +1,7 @@
 # my-bot 实施计划
 
 > 2026-10-21 制定，依据 `docs/spec.md`（下文 §x 均指 spec 章节）与流程走查 `docs/flow.md`（F1…F12 为流程，G1…G18 为走查发现的缺口）。spec 是契约，本计划只回答「按什么顺序做、每步怎么验证」。
-> **当前阶段：A 流程定稿——A1–A5 已完成，等用户确认 spec 定稿；尚未开始写代码。**实施中发现 spec 有误或缺口，先改 spec 再改代码。
+> **当前阶段：A 流程定稿与 P0 核验均已完成（2026-10-21），结论已写回 spec；下一步是 M0。尚未开始写正式代码。**实施中发现 spec 有误或缺口，先改 spec 再改代码。
 > 每个任务完成的定义（DoD）：代码过 `gofmt -l . && go vet ./... && go test ./...`；并发相关加跑 `go test -race`；逐条对照 `docs/agents-dot-md/code-checklist.md`；涉及契约变更时 spec 已同步。
 
 ## 总览
@@ -46,7 +46,12 @@ A 完成标准：flow.md 的 G1–G18 全部标为「已写回」（已完成）
 | P0-5 | `codex app-server` | 同 P0-4；另确认一个进程多 thread 的并发行为、设备码登录与 `CODEX_HOME` | §7.2 表、§7.3 |
 | P0-6 | 自托管 mem0 | REST 的 add / search / delete、`infer=false`、按 `agent_id` 与 metadata 过滤、相似度分数含义；从 k3s Pod 访问宿主机 docker 服务的地址 | §14.5 |
 
-P0 完成标准：上述 6 项结论已写回 spec，spec 中不再有指向 P0 的「实现前核验」字样（M2 才用到的 P0-6 可延后到 M2 开工前）。
+P0 完成标准：上述 6 项结论已写回 spec，spec 中不再有指向 P0 的「实现前核验」字样。
+
+**状态：✅ 已完成（2026-10-21）**。锁定版本：Dapr runtime 1.18.7 / CLI 1.18.2、go-sdk v1.15.0、durabletask-go v0.12.6（随 Dapr）、a2a-go/v2 v2.6.0、pi 1.3.0、codex-cli 0.163.0。对计划影响最大的三条结论：
+- Workflow 等待统一用单事件名 `signal` 的 inbox 写法，`ContinueAsNew` 带 `WithKeepUnprocessedEvents()`，不需要控制命令队列（spec §5.2）。
+- Redis 上的 State 事务失败不回滚，跨键更新改为顺序写 + 幂等 + 对账（spec §6）；对已完成实例再 `ScheduleWorkflow` 会重新执行，补启动前必须先查实例（spec §8）。
+- codex 的 threadId 只能由服务端生成，Recover 对非完成的轮次一律记 `interrupted`（spec §7.2）。
 
 ---
 
@@ -116,10 +121,10 @@ P0 完成标准：上述 6 项结论已写回 spec，spec 中不再有指向 P0 
 按以下顺序递增实现，每步都有对应测试再进入下一步：
 1. `single` 策略单 Step 闭环：Scheduler `Acquire`（带 `PreferWorker`）→ `SubmitAttempt` → 等 `attempt-done` / 60s `PollAttempt` → `CollectStep` → `CollectRound` → 判停 → `ContinueAsNew`。
 2. 重试与失败：Activity 分类型 RetryPolicy（§5.2 表）；不可重试错误走返回值；Step 内退避重试；`unknown` / `auth_required` → `waiting`；Role.timeout → `CancelAttempt`。
-3. 控制事件：统一事件名 `control`；**所有等待点**（slot-granted、attempt-done、Loop 定时器、ask_user、paused）都 `when_any` 控制事件（§5.2 等待规则）；cancel 的取消流程；P0-2 结论决定是否改用 `goal:<id>:control` 队列。
+3. 等待与控制：实现 §5.2 的 inbox（单事件名 `signal`，按 `kind` 分派，非当前等待对象的信号进入待处理表）；**所有等待点**都只做 `WaitForExternalEvent("signal", 超时)`；每轮开头非阻塞读空 inbox；`ContinueAsNew` 带 `WithKeepUnprocessedEvents()`；cancel 的取消流程。
    孤儿判定：`PollAttempt` 连续失败且 Worker 注册记录过期超过 `orphanAfter` → `interrupted(worker_lost)`。
 4. `brain` 策略：大脑 Step → `ParseDecision`（不重试）→ 校验失败回传重试（2 次计入 FailStreak）→ 成员 fan-out（≤ maxParallel，同 workspace 串行）→ fan-in → `LastResults`。
-5. `ask_user`：确定性 requestID，`when_any(user-input, timer)`，超时转 `paused`。
+5. `ask_user`：确定性 requestID，等 `kind=user-input` 信号（超时 askTimeout），超时转 `paused`。
 6. 投影与事件：每个 Activity 写 `goal:<id>` 与事件（`EventID` 覆盖写），事务更新 active 索引。
 7. `FinishGoal`：终态投影、释放全部 lease、`goal.finished` 事件。
 - 文件：`internal/orchestrator/{workflow.go,activities.go,prompt.go,retry.go}`；`prompt.go` 实现 §7.1 的两种提示词组装（M0 的 memory 两段留空）。
@@ -246,7 +251,7 @@ M2 完成标准：§12 全部通过并完成 24h 浸泡。
 
 | 风险 | 早期信号 | 应对 |
 | --- | --- | --- |
-| Dapr Go Workflow 不支持非阻塞读事件或 ContinueAsNew 丢事件 | P0-2 | 控制事件改为「每轮开始前由 Activity 读取 `goal:<id>:control` 队列」，Workflow 只在等待点监听唤醒事件 |
+| inbox 写法下 Workflow 状态机复杂、重放出错 | M0 T8 | 把「收到信号后的下一步」抽成 `core` 纯函数并穷举单测；Workflow 只负责等待和调用 |
 | a2a-go 不成熟或不支持扩展方法 | P0-3 | 按 attemptKey 查询改为 Worker 普通 HTTP 接口；必要时 A2A 只保留 Agent Card + SendMessage/GetTask |
 | Pi / Codex 的 RPC 无法可靠判断「回答是否完整」 | P0-4/5 | Recover 退化为：有终态记录则取，否则一律 `interrupted` |
 | fake 执行器掩盖真实时序问题 | M1 初期 | M1 第一周就用真实 Pi 重跑 M0 的重启用例 |

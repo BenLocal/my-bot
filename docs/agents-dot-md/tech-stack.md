@@ -2,7 +2,7 @@
 
 > 技术选型、存储与配置约定、构建与验证命令；写代码前先看本文，按既有方式扩展。
 
-结构与取舍见 `architecture.md`，完整契约见 `docs/spec.md`。标「待锁定」的版本在 M0 核验后回填到这里和 spec。
+结构与取舍见 `architecture.md`，完整契约见 `docs/spec.md`。以下版本于 2026-10-21 经 P0 核验锁定；升级任何一项前先在 spikes 中复测相关行为。
 
 ## 一、项目概览
 
@@ -15,18 +15,19 @@
 | 类别 | 选型 | 版本 | 备注 |
 |---|---|---|---|
 | 语言 | Go | 1.27 | |
-| 分布式运行时 | Dapr（Workflow、Actor、State、Pub/Sub） | 待锁定 | Go SDK `github.com/dapr/go-sdk` |
-| Agent 协议 | A2A 1.0.1 | SDK 待锁定 | `github.com/a2aproject/a2a-go`，HTTP JSON-RPC + SSE |
-| 存储 / 消息 | Redis（state.redis + pubsub.redis） | 待锁定 | AOF 持久化；首版不引入 PostgreSQL |
-| 编排 | k3s | 待锁定 | 只用标准 K8s 资源；kustomize |
-| 执行器 | pi（`--mode rpc`）、codex（`app-server`） | 待核验 | 只在 Worker 镜像内 |
+| 分布式运行时 | Dapr（Workflow、Actor、State、Pub/Sub） | runtime 1.18.7、CLI 1.18.2 | Go SDK `github.com/dapr/go-sdk` v1.15.0；Workflow 用 `github.com/dapr/durabletask-go/workflow`（v0.12.6，随 Dapr 1.18；不越级到 v0.15）；Actor 必须用 `service/http` |
+| Agent 协议 | A2A 1.0 | a2a-go v2.6.0 | `github.com/a2aproject/a2a-go/v2`，HTTP JSON-RPC + SSE |
+| 存储 / 消息 | Redis（state.redis + pubsub.redis） | 随 `dapr init` / 部署清单 | AOF 持久化；`keyPrefix: none`；首版不引入 PostgreSQL |
+| 编排 | k3s | M2 安装时锁定 | 只用标准 K8s 资源；kustomize |
+| 执行器 | pi（`--mode rpc`）、codex（`app-server`） | pi 1.3.0、codex-cli 0.163.0 | 只在 Worker 镜像内；协议细节见 spec §7.2 |
+| 长期记忆 L2 | 自托管 mem0（REST） | 现有部署 | 见 spec §14.5 |
 
 同类能力已有选型时不引入第二套（HTTP 路由、日志、配置库各只用一种，首次引入时记录在此）。
 
 ## 三、存储约定
 
 - 所有持久化经 Dapr State API，封装在 `internal/store`；业务代码不直连 Redis。
-- 键名规范见 spec §6；跨键原子更新用 State 事务，并发写用 ETag。
+- 键名规范见 spec §6；并发写用 ETag。Redis 上的 State 事务失败时不回滚，跨键更新用「顺序写 + 每步幂等 + 对账修复」，不依赖事务原子性。
 - 首次写入去重（attemptKey、Idempotency-Key）用条件写，不先读后写。
 
 ## 四、配置

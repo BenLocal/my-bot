@@ -4,6 +4,7 @@
 > 本文定义跨里程碑的**硬契约**（组件边界、协议、状态键、API、调度语义）和 M0–M2 的可实现规格；M3 及以后的细节在开工前补充到本文。
 > 标注「实现前核验」的条目依赖外部版本行为，开工第一步先用最小程序验证并锁定版本，再改本文。
 > 2026-10-21 按流程走查 `docs/flow.md` 修订：补齐 G1–G18；采纳单一 `Scheduler` Actor（G3）与共享工作区卷（G8）。
+> 2026-10-21 P0 核验完成（Dapr 1.18.7、a2a-go v2.6.0、pi 1.3.0、codex-cli 0.163.0、自托管 mem0），全部「实现前核验」已替换为实测结论；证据在本地 `spikes/*/RESULT.md`（不入库）。
 
 ## 1. 概述
 
@@ -215,7 +216,7 @@ Attempt：`submitting → submitted → working → completed | failed | rejecte
 ```go
 type Scheduler interface {
     // 有容量：立即返回 lease（含选中的 workerID、sessionPolicy）。
-    // 无容量：把请求加入 FIFO 队列，返回 Granted=false；之后通过 RaiseEvent(instanceID, "slot-granted:<attemptKey>", lease) 交付。
+    // 无容量：把请求加入 FIFO 队列，返回 Granted=false；之后通过 RaiseEvent(instanceID, "signal", {kind: slot-granted, key: attemptKey, lease}) 交付（§5.2 inbox）。
     // 对同一 AttemptKey 幂等：已有 lease 直接返回，已在队列中不重复入队。
     Acquire(ctx, req AcquireReq) (AcquireResp, error)
     Release(ctx, leaseID string) error            // 释放并按 FIFO 依次尝试满足排队请求
@@ -244,7 +245,8 @@ type AcquireReq struct {
 
 其他：
 - Lease 绑定 AttemptKey，记录 workerID；`inflight` 由 lease 计数得出，不依赖 Worker 自报。
-- Workflow 在等待 `slot-granted:<attemptKey>` 时同时监听控制事件（§5.2 等待规则），并设 10 分钟超时后重新 `Acquire`（幂等，防丢事件）。
+- Workflow 等待 `slot-granted` 信号（§5.2 inbox，同时处理控制信号），10 分钟没拿到就重新 `Acquire`（幂等，防丢事件）。
+- 实现约束（P0-1 实测）：Actor 必须挂在 HTTP app channel（`github.com/dapr/go-sdk/service/http`），gRPC service 注册 Actor 会直接 panic；Workflow worker 与 Actor 可在同一进程。Actor 方法内用 workflow client 调 `RaiseEvent` 已验证可行。Reminder 由 dapr scheduler 持久化（不在 Redis），`ReminderCall` 回调中的 `period` 参数为空，周期需自行保存。
 - 1 分钟 Actor reminder：回收对应 Attempt 或 Goal 已终态的 lease；处理 `AffinityWait` 到期的排队请求；重新尝试满足队列（注册表变化，如新 Worker 加入，也能被及时用上）。
 - 公平：一轮结束立即释放；Loop 等下一轮期间不占 lease；大脑 Step 结束即释放，成员执行期间大脑不占 lease。
 - 限流（flow F9）：Worker 回报 `rate_limited`（可带 `retryAfter`）→ Runtime 调 `Cooldown`；冷却期内该账号不发新 lease，本 Step 按可重试错误退避。
@@ -282,18 +284,19 @@ type GoalState struct {
    - `brain`：先运行一个 `role=brain` 的 Step（走下面第 4–6 步的单 Step 流程），A `ParseDecision` 解析并校验决策（§5.3）。决策为 `finish` 则跳到第 8 步做最终验收；`ask_user` 则进入 `waiting` 等 `append`/`resume`；`dispatch` 得到成员 Step 列表。校验失败把错误原因回传大脑重试，连续 2 次失败计入 `FailStreak`。
 4. W：对每个 Step 向 Scheduler `Acquire`（§5.1），带 `PreferWorker = LastWorker[role]`；拿到的 lease 决定 Worker 与 `sessionPolicy`。
 5. A `SubmitAttempt`：组装上下文（§7.1），用 `AttemptKey = <goalID>-r<round>-<stepID>-a<attempt>` 调 Worker A2A `SendMessage`；写投影记录。超时或网络错误时，Activity 内先按 key 对账，查到则复用。
-6. W：等待完成：等 `attempt-done:<key>`，60s 无事件则 A `PollAttempt` 一次，未终态回到等待。`PollAttempt` 连续失败（Worker 不可达）且注册表中该 Worker 记录已过期超过 `orphanAfter`（默认 5 分钟）时，判 `interrupted(worker_lost)`、释放 lease，按可重试处理（flow G13；工作区在共享卷上，新尝试可在别的 Worker 上继续）。Step 超时 = Role.timeout，超时后 A `CancelAttempt` 并以 `failed(timeout)` 处理。成员 Step 并行：第 4–6 步对每个 Step 各起一个 Workflow 任务，用 `ctx` 的并发等待（fan-out / fan-in）汇合；同一 Goal 同时运行的成员 Step ≤ `maxParallel`（默认 2）。
+6. W：等待完成：等 `attempt-done` 信号（inbox，60s 超时），超时则 A `PollAttempt` 一次，未终态回到等待。`PollAttempt` 连续失败（Worker 不可达）且注册表中该 Worker 记录已过期超过 `orphanAfter`（默认 5 分钟）时，判 `interrupted(worker_lost)`、释放 lease，按可重试处理（flow G13；工作区在共享卷上，新尝试可在别的 Worker 上继续）。Step 超时 = Role.timeout，超时后 A `CancelAttempt` 并以 `failed(timeout)` 处理。成员 Step 并行：各 Step 的 Acquire / Submit / Poll 都是 Activity，用 `[]Task` 收集后逐个 `Await` 实现 fan-out / fan-in（P0-2 实测并行生效）；各 Step 的完成通过 inbox 信号逐个到达，Workflow 维护「运行中 Step 集合」直到全部终态；同一 Goal 同时运行的成员 Step ≤ `maxParallel`（默认 2）。
 7. A `CollectStep`：拉产物、用量，执行 Step 验收（§7.4），写事件。可重试失败且 `Attempt < 3` 的 Step 在本轮内指数退避后重试；`unknown` / `auth_required` 使 Goal 进入 `waiting`（已完成的 Step 结果保留）。
 8. A `CollectRound`：汇总本轮各 Step 结果与产物；进展摘要 `Progress` 取大脑本轮决策的 `summary`（确定性策略下取成员输出的 `summary`），截断到 4 KiB，不另调模型（flow G6）；确定性策略下执行 Goal 验收，`brain` 策略下大脑 `finish` 后执行 Goal 验收。释放槽位；更新 `FailStreak/NoProgress/Budget`。
 9. W：大脑 `finish`（或确定性策略的 `done=true`）后先执行 Goal 级 `check`（§7.4，作为一个特殊 Step，走同样的 Acquire / Submit / 等待流程）；通过 → A `CommitMemories`（若有，§14.3）→ `FinishGoal(succeeded)`；不通过 → 结果作为下一轮大脑输入，计入 `FailStreak`。Loop → 计算下次时间 `CreateTimer(next)`；然后 `Round+1` 并 `ContinueAsNew(state)`。`brain` 策略下本轮成员结果写入 `GoalState.LastResults`，作为下一轮大脑的输入。
 
-**等待规则**（flow G11）：Workflow 的每一个等待点——等 `slot-granted`、等 `attempt-done`、Loop 的下次执行定时器、`ask_user`、`paused` 状态——都用 `when_any(业务事件或定时器, 控制事件 "control")` 等待。收到控制事件后：
-- `cancel`：对所有运行中的 Attempt 调 `CancelAttempt`，等它们到终态（每个上限 2 分钟，超时记 `interrupted`）→ 释放全部 lease（含排队中的请求，Scheduler 会移除）→ `FinishGoal(cancelled)`。
-- `pause`：有运行中的 Step 时，记下 `Paused=true`，本轮结束后停；没有则立即停。
-- `append`：存进 `PendingNotes`，继续原来的等待。
-- `resume`：仅在 `paused` / `waiting` 时有意义，其余忽略。
-
-控制事件统一用一个事件名 `control`（载荷带 `op`），避免多个事件名在 `when_any` 中组合爆炸。实现前核验（P0-2）：Dapr Go SDK 中 `when_any` 的写法，以及 `ContinueAsNew` 时尚未处理的 `control` 事件是否保留；不保留时改为 API 同时把控制命令写入 `goal:<id>:control` 队列，Workflow 每次醒来由 Activity 读取。
+**等待规则与 inbox**（flow G11；P0-2 实测）：所有发给 Goal 实例的外部事件都用**同一个事件名 `signal`**，载荷 `{kind, key, data}` 区分：`kind ∈ {control, slot-granted, attempt-done, user-input}`。Workflow 的每个等待点——等槽位、等 Attempt、Loop 下次执行定时器、`ask_user`、`paused`——都只做一件事：`WaitForExternalEvent("signal", 本等待点的超时)`，醒来后按 `kind` 分派；不是当前等待对象的信号（例如等槽位时先到了另一个 Step 的 `attempt-done`）存进 Workflow 内存中的待处理表，继续等待。这样每个等待点都是「一个事件对一个超时」，Dapr 1.18 自带的 durabletask-go v0.12.6 原生支持，不依赖 v0.15 才有的 `Select`。
+- 每轮开头先非阻塞地读空 inbox：循环 `WaitForExternalEvent("signal", 0)`，直到返回 `task.ErrTaskCanceled`（实测：有事件立即返回，无事件立即返回该错误）。
+- `ContinueAsNew` **必须**带 `workflow.WithKeepUnprocessedEvents()`：实测未处理的事件会按原顺序带入下一代；不加则丢失。因此不需要额外的控制命令队列。
+- 收到 `control` 后：
+  - `cancel`：对所有运行中的 Attempt 调 `CancelAttempt`，等它们到终态（每个上限 2 分钟，超时记 `interrupted`）→ 释放全部 lease（含排队中的请求，Scheduler 会移除）→ `FinishGoal(cancelled)`。
+  - `pause`：有运行中的 Step 时，记下 `Paused=true`，本轮结束后停；没有则立即停。
+  - `append`：存进 `PendingNotes`，继续原来的等待。
+  - `resume`：仅在 `paused` / `waiting` 时有意义，其余忽略。
 
 **Activity 重试策略按类型区分**（Dapr Agents 全局只有一个 RetryPolicy，不照搬）：
 
@@ -304,7 +307,7 @@ type GoalState struct {
 | `ParseDecision` | 不重试 | 解析/校验失败作为返回值交给 Workflow，按 §5.3 回传大脑 |
 | `CancelAttempt` | 3 次 | 取消是请求，结果以 Poll 为准 |
 
-不可重试的错误一律作为 Activity **返回值**（带 `Retryable=false`）而非 error 返回，避免被 Dapr 的 Activity 重试吞掉语义。
+不可重试的错误一律作为 Activity **返回值**（带 `Retryable=false`）而非 error 返回，避免被 Dapr 的 Activity 重试吞掉语义。API（P0-2 实测）：`ctx.CallActivity(fn, workflow.WithActivityInput(in), workflow.WithActivityRetryPolicy(&workflow.RetryPolicy{MaxAttempts, InitialRetryInterval, BackoffCoefficient, MaxRetryInterval}))`；**不传 policy 即不重试**（表中「不重试」就是不传）。
 
 **确定性 ID**：Workflow 内所有 ID（attemptKey、事件 ID、ask 请求 ID、子实例 ID）都由 goalID、round、stepID 等推导，禁止在 Workflow 代码里生成随机 UUID（Dapr Agents `durable.py` 用 `uuid4()` 生成子实例 ID，重放时会变化，是反例）。
 
@@ -326,7 +329,7 @@ type GoalState struct {
 
 `action ∈ {dispatch, finish, ask_user}`；`ask_user` 时带 `question`，作为 `goal.waiting` 事件推给用户。
 
-`ask_user` 的等待：请求 ID = `ask:<goalID>:r<round>:<n>`（确定性）；Workflow 用 `when_any(WaitForExternalEvent("user-input:<requestID>"), CreateTimer(askTimeout))` 等待，`askTimeout` 默认 24h，超时 Goal 转 `paused`（原因 `ask_timeout`），不自动替用户作答。等待期间不占槽位、不保留执行器进程。用户经 `POST /goals/{id}:append` 带 `replyTo=<requestID>` 回答；已过期或已回答的 requestID 返回 409。
+`ask_user` 的等待：请求 ID = `ask:<goalID>:r<round>:<n>`（确定性）；Workflow 等 `kind=user-input, key=<requestID>` 的 inbox 信号，超时为 `askTimeout`，`askTimeout` 默认 24h，超时 Goal 转 `paused`（原因 `ask_timeout`），不自动替用户作答。等待期间不占槽位、不保留执行器进程。用户经 `POST /goals/{id}:append` 带 `replyTo=<requestID>` 回答；已过期或已回答的 requestID 返回 409。
 
 Runtime 校验（不通过则不执行）：
 
@@ -351,11 +354,11 @@ Workflow 代码只做确定性逻辑；时间只取 `ctx.CurrentUTCDateTime()`�
 
 ### 5.5 完成通知
 
-Worker 在 Attempt 到终态时发布到 `attempt-events`：`{attemptKey, goalID, status, at}`。Runtime 订阅后 `RaiseEvent(goalID, "attempt-done:<key>")`。重复或丢失都无害：Workflow 收到事件后仍以 `PollAttempt` 的结果为准，丢失则由 60s 轮询兜底。
+Worker 在 Attempt 到终态时发布到 `attempt-events`：`{attemptKey, goalID, status, at}`。Runtime 订阅后 `RaiseEvent(goalID, "signal", {kind: attempt-done, key: attemptKey})`。重复或丢失都无害：Workflow 收到事件后仍以 `PollAttempt` 的结果为准，丢失则由 60s 轮询兜底。
 
 订阅处理（参照 Dapr Agents `workflow/utils/subscription.py`）：
 
-- 返回三态：消息解析失败 → `DROP`；`RaiseEvent` 成功或实例已结束 → `SUCCESS`；Dapr 调用出错 → `RETRY`。
+- 返回三态：消息解析失败 → `DROP`；`RaiseEvent` 返回 nil → `SUCCESS`（实测：实例已完成或已终止时也返回 nil，事件被丢弃）；错误信息含 `no such instance exists`（实例不存在，gRPC 码为 Unknown，只能按字符串匹配）→ `DROP`；其他错误 → `RETRY`。
 - 配死信 topic `attempt-events-dead`。
 - 如需去重，**只在得到 SUCCESS/DROP 之后标记已处理**；到达即标记会让 RETRY 的重投被去重吃掉。首版不设去重存储：实例 ID 就是 goalID，`RaiseEvent` 重复无害。
 
@@ -375,28 +378,35 @@ Worker 在 Attempt 到终态时发布到 `attempt-events`：`{attemptKey, goalID
 | `memsync:<entryID>` | Runtime | L1 条目与 mem0 记录的映射 `{mem0ID, sha256}`（§14.5） |
 | Workflow 历史 | Dapr | 平台不直接读写 |
 
-- 跨键原子更新用 Dapr State 事务（Redis 支持）：如「写 goal 投影 + 更新 active 索引」同一事务。
+- **不依赖跨键事务的原子性**（P0-1 实测）：Redis 上的 State 事务只有在全部成功时才原子；其中一条 ETag 条件写冲突时，同一事务中已执行的其他写入**不会回滚**。因此跨键更新（如「写 goal 投影 + 更新 active 索引」）一律改为**顺序写 + 每步幂等 + 定期对账修复**；条件写不与其他写放在同一事务里。
+- 冲突错误归一化：过期 ETag 返回 gRPC `Aborted`；first-write 遇到已存在的键返回 `Internal`，信息含 `failed to set key` / `possible etag mismatch`。`store` 层把两者都映射为 `ErrConflict`。
 - 索引（`registry:*:_index`、`goal:_index:*`）的修改统一走 `store.MutateIndex(key, func(ids) (ids, changed bool))`（参照 Dapr Agents `components.py` 的 `_mutate_team_index`）：读 ETag → 回调 → 未变化不写 → 条件写；冲突用 full-jitter 指数退避（50ms 起，上限 1s），总耗时预算 10s。
 - 注册顺序：先写单条记录，再加入索引；注销反过来，先删记录再出索引。读取时跳过索引中已不存在（含 TTL 过期）的记录。
 - TTL 只让单条记录过期，索引不会自动清理：Runtime 每 5 分钟用 `MutateIndex` 清掉指向不存在记录的 ID。
 - 条件写（first-write）冲突时**先回读**：记录的 owner 是自己（同一 attemptKey + 同一提交者）就当作写成功，不报重复——这对应「写成功但响应丢失后重试」的情况。
 - Redis 必须开 AOF（`appendonly yes`，`appendfsync everysec`）并挂 PVC。
 - 大文件不进 Redis，只存引用与哈希。
-- 实现前核验：Redis state store 的事务 + ETag + TTL 在所选 Dapr 版本中同时可用；actor/workflow 用同一个 Redis 实例的可行性与 key 前缀隔离。
+- `ttlInSeconds` 可用，事务内的操作带 TTL 也生效（P0-1 实测）。
+- 一个 Redis 可同时承载普通 state、actor state 与 workflow state，按前缀隔离（实测）：普通 state 为 `<appID>||<key>`；actor 为 `<appID>||<ActorType>||<ActorID>||<key>`；workflow 为 `<appID>||dapr.internal.<ns>.<appID>.workflow||<instanceID>||history-N|metadata|customStatus`。Actor reminder 存在 dapr scheduler 中。
+- 普通 state 默认带 appID 前缀，Worker 写、Runtime 读的键（`registry:*`、`worker:*:attempt:*`）会落在不同空间。`statestore` 组件设 `keyPrefix: none`，所有 my-bot 键自带业务前缀，不依赖 appID。
+- Dapr 对「Redis 作 actor state store」给出不建议用于生产的警告（无事务回滚）；个人场景接受，配合 AOF 与上面的「顺序写 + 对账」规则。
 
 ## 7. 执行器接入
 
 ### 7.1 Runtime ↔ Worker：A2A
 
-- 规范 A2A 1.0.1，Go SDK `github.com/a2aproject/a2a-go`；传输固定 HTTP JSON-RPC + SSE。实现前核验 SDK 发布版本与字段，锁定后写入本节。
+- 协议 A2A 1.0（SDK 声明 `a2a.Version = "1.0"`，不区分补丁号），Go SDK `github.com/a2aproject/a2a-go/v2 v2.6.0`（模块路径带 `/v2`）；传输固定 HTTP JSON-RPC + SSE。方法名为 PascalCase（`SendMessage`、`GetTask`、`CancelTask`、`SubscribeToTask`），状态值为 `TASK_STATE_*`。
+- 提交必须设 `Config.ReturnImmediately=true`：SDK 默认会阻塞到任务结束；Worker 侧也强制按立即返回处理。执行在独立于 HTTP 请求的后台 context 中进行。
+- SDK 与规范都**没有**请求去重（同一 messageId 发两次得到两个 Task），也不允许客户端指定 TaskID；去重完全由 Worker 按 attemptKey 实现（§7.2）。
+- Worker 用 `a2asrv.WithTaskStore` 接入自定义 `taskstore.Store`（Create / Update / Get / List，带版本号并发控制），实现基于 Dapr State 的 attempt 记录；Worker 重启后由 `Driver.Recover` 直接改写任务状态。重启后 `SubscribeToTask` 只推送一次当前快照即结束，Runtime 以 `GetTask` 为准。
 - Runtime 直连 Worker Pod（StatefulSet headless Service：`mybot-worker-pi-0.mybot-worker-pi.mybot.svc:8080`），因为 Attempt 绑定在具体实例上。不走 Dapr service invocation（SSE 转发与超时未验证）。
-- 认证：集群内共享 Bearer token（Secret `mybot-internal-token`）。
+- 认证：集群内共享 Bearer token（Secret `mybot-internal-token`）。服务端用 HTTP 中间件校验（无 token 返回 401），客户端用 `a2aclient.AuthInterceptor`；Agent Card 声明 `HTTPAuthSecurityScheme{Scheme: "Bearer"}`，用 `a2asrv.NewStaticAgentCardHandler` 挂在 `/.well-known/agent-card.json`。
 
 | 平台操作 | A2A | my-bot 约定 |
 | --- | --- | --- |
 | 发现 | Agent Card | Worker 启动时同时写注册表；Runtime 拉 Agent Card 校验 executor/version |
-| 提交 | `SendMessage` | `metadata["mybot/attemptKey"]` 必填，Worker 按它去重；必须返回 Task（不返回即时 Message） |
-| 查询 | `GetTask` | 恢复与对账的唯一依据；按 remoteTaskID 查，Worker 另提供按 attemptKey 查（扩展方法 `mybot/getByAttemptKey`） |
+| 提交 | `SendMessage`（`ReturnImmediately=true`） | 请求级 `SendMessageRequest.metadata["mybot/attemptKey"]` 必填（服务端从 `execCtx.Metadata` 读取），Worker 按它去重；必须返回 Task（不返回即时 Message） |
+| 查询 | `GetTask` | 恢复与对账的唯一依据；按 remoteTaskID 查。按 attemptKey 查用 Worker 的普通 HTTP 接口 `GET /mybot/attempts/{attemptKey}`（SDK 不支持自定义 JSON-RPC 方法，未知方法返回 -32601） |
 | 进展 | `SubscribeToTask`（SSE） | 只用于展示事件，断线不影响正确性 |
 | 取消 | `CancelTask` | 请求语义；最终状态以 `GetTask` 为准 |
 | 产物 | Task `artifacts` | `uri = mybot-artifact://<goalID>/r<round>/<stepID>/<name>` + sha256，对应共享卷 `/data/artifacts/<goalID>/r<round>/<stepID>/<name>` |
@@ -453,13 +463,15 @@ type Status struct {
 `Events` 必须以 `completed`、`failed`、`paused` 之一作为最后一个事件结束；没有终态事件就关闭通道视为 Driver 缺陷，Attempt 记 `failed(driver_bug)`。不可重试：`auth_required`、`budget_exceeded`、`context_too_long`、执行器二进制缺失、4xx 类请求错误；`rate_limited` 可重试但先触发账号冷却（§5.1）。
 
 Worker 处理 `SendMessage`：
-1. 以 attemptKey 做 `first-write`（ETag 为空的条件写）存 `worker:<id>:attempt:<key>`；已存在则直接返回已有 Task（冲突时按 §6 先回读判断 owner）。
-2. **会话 ID 在启动前确定并写入记录**：`reuse` 时取同一 Goal + 角色上一次记录中的会话 ID，没有则按 `uuid5(goalID + ":" + role)` 派生；`fresh` 时按 `uuid5(attemptKey)` 派生。然后才 `Driver.Start`。
-3. 终态时：**先等执行器把会话落盘**（Pi 进程退出 / jsonl flush，Codex thread 结束事件），再写终态记录 → 发布 `attempt-events`。否则下一轮 `reuse` 可能读到不完整的会话。
+1. 以 attemptKey 做 `first-write` 写入占位记录 `worker:<id>:attempt:<key> = {state: reserving}`；冲突则按 §6 回读：已有 TaskID 就直接返回该 Task，仍在 `reserving` 就短暂轮询等待回填。写成功后再由 SDK 创建 Task，拿到 TaskID 立即回填到记录（TaskID 只能由 SDK 生成）。
+2. **会话在启动执行前确定并写入记录**：`reuse` 时取同一 Goal + 角色上一次记录中的会话 ID。新会话的 ID 按执行器能力区分（P0-4/5 实测）：pi 可以指定，按 `uuid5(goalID + ":" + role)`（`fresh` 时 `uuid5(attemptKey)`）派生，经 `--session-id` 传入；codex 的 threadId 只能由服务端生成，Driver 先 `thread/start`，拿到 threadId 后写入记录，再 `turn/start`（若在写记录前崩溃，只留下一个空 thread，无副作用）。两者都在提交时把 attemptKey 作为本轮的定位标记：pi 写在提示首行，codex 同时放进 `turn/start.clientUserMessageId`。
+3. 终态时：**先确认执行器已把本轮写入会话**，再写终态记录 → 发布 `attempt-events`。实测判据：pi 收到 `agent_settled`（每条消息结束时已同步写入 jsonl，不必等进程退出）；codex 收到 `turn/completed`（此时 rollout 已含本轮终态记录）。
 
-Worker 心跳（每 15s）同时上报 `authOK`：由 Driver 用执行器自身的状态命令检测登录是否有效（检测方式在 P0-4/5 核验），供 Scheduler 自动解除 `needs_auth`（§5.1）。
+Worker 心跳（每 15s）同时上报 `authOK`，供 Scheduler 自动解除 `needs_auth`（§5.1）：
+- codex：常驻 app-server 上 `account/read {refreshToken:false}` 返回 `account != null`，且最近一次 turn 没有因 401/403 失败。每个 turn 开始前也用同一方法预检——未登录时 turn 不会立即失败，而是重试约 38 秒后才报 401。
+- pi：`pi auth check --provider <p> --json` 只能证明凭据存在（无效 key 也返回 ready），因此 `authOK` = 凭据存在且最近一次调用没有 401/403。
 
-Worker 启动时扫描本实例非终态记录，逐条 `Driver.Recover`，判据（参照 Dapr Agents `executors/claude.py` 的 `_plan`，但以 attemptKey 而非提示文本为准）：
+Worker 启动时扫描本实例非终态记录，逐条 `Driver.Recover`，判据（参照 Dapr Agents `executors/claude.py` 的 `_plan`，但以 attemptKey 而非提示文本为准；各执行器的具体做法见下表后的说明）：
 - 会话中能找到本 attemptKey 的提示且其后已有完整回答 → 直接取回答作为结果（不再调用模型），记 `completed`。
 - 能找到提示但回答不完整、且本轮尚未产生外部副作用（工具调用记录为空）→ 续接会话发送「继续」提示，不重复原提示。
 - 已有工具调用但无法确认结果 → 记 `interrupted`，交给 Runtime 按重试规则处理，**不自动重放工具调用**。
@@ -467,20 +479,39 @@ Worker 启动时扫描本实例非终态记录，逐条 `Driver.Recover`，判�
 
 提示正文首行带 `[mybot attempt <attemptKey>]` 标记，供 Recover 定位。
 
-**用量按增量记账**：执行器只提供会话累计值时，Usage = 本次结束时累计值 − 本次开始前累计值；增量按 attemptKey 存，重试同一 attemptKey 不重复计费。
+各执行器的 Recover（P0-4/5 实测）：
+- **pi**：在 jsonl 中找首行为该标记的最后一条 user 消息，看其后的记录。最后一条 assistant 消息 `stopReason=="stop"`（`length` 视为完整但截断）且没有悬空的工具调用 → `completed`；出现过 assistant 消息中的 `toolCall` 块或 `toolResult` 消息 → `interrupted`；两者都没有、回答不完整 → 用同一会话发「继续」提示。注意 `stopReason:"error"` 的消息也会落盘，要识别为失败而不是回答。
+- **codex**：不解析文件，起 app-server 调 `thread/turns/list {threadId, itemsView: "full"}`，按 `clientId == attemptKey` 找到该轮。`completed` → 取 `phase=="final_answer"` 的回答；`failed` → 按错误分类；`interrupted` 或找不到 → **一律 `interrupted`，不发「继续」**。原因：实测进程被硬杀时，连用户消息都可能没写进 rollout，「没有工具调用记录」不能证明没有外部副作用。
+
+**用量按增量记账**：Usage = 本次结束时的会话累计值 − 本次开始前的累计值；增量按 attemptKey 存，重试同一 attemptKey 不重复计费。实测：pi 每条 assistant 消息的 `usage` 是单次模型调用的值（一个 Attempt 可能有多次调用），用 `get_session_stats` 在提示前后取差，Recover 时对该轮之后的 `usage` 求和；codex 的 `thread/tokenUsage/updated` 中 `total` 是 thread 累计值（跨重启保留），`last` 是单次请求，按 turn 前后的 `total` 取差。
 
 | 执行器 | 原生接口 | 会话 | 用量 |
 | --- | --- | --- | --- |
-| `pi` | `pi --mode rpc`（stdin/stdout JSON 行），每个 Goal 一个进程，cwd = 工作区 | session jsonl 存 `/data/sessions/pi/`，`reuse` 时用同一 session 继续 | 取 assistant 消息 `usage.totalTokens` |
-| `codex` | `codex app-server`（JSON-RPC over stdio），一个进程多 thread | thread ID 存 Attempt 记录 | 取 token 用量事件 |
+| `pi`（1.3.0 已核验） | `pi --mode rpc`（stdin/stdout JSONL，按 `\n` 分帧）。每个 Goal 一个进程，cwd 固定为工作区。命令 `prompt` / `abort` / `get_state` / `get_session_stats`；**唯一终态信号 `agent_settled`**（`agent_end` 之后仍可能有重试或压缩），结果看最后一条 assistant 的 `stopReason`（stop / error / aborted）与 `errorMessage`。工具不需审批、无沙箱，Role 用 `--tools` 限定可用工具。关闭 pi 自带重试（settings `retry.enabled:false`），由 Driver 分类错误 | `--session-dir /data/sessions/pi/<goalID> --session-id <uuid>`：存在即续接，不存在则新建。按会话记录的 cwd 查找，**cwd 变了会悄悄新建同 ID 的会话**，所以同一会话 cwd 必须不变；同一会话文件同时只允许一个进程 | 见上文「用量按增量记账」 |
+| `codex`（codex-cli 0.163.0 已核验） | `codex app-server`（stdio JSONL，无 `jsonrpc` 字段）：`initialize` → `initialized` → `thread/start` 或 `thread/resume` → `turn/start`。**唯一终态信号 `turn/completed`**（`turn.status` = completed / failed / interrupted，失败带 `turn.error.codexErrorInfo`）；`error` 通知带 `willRetry:true` 时不是终态。取消用 `turn/interrupt`，对已结束的 turn 不会回应，需要超时。一个进程可多 thread 并发，**同一 thread 内必须串行**（活动中再 `turn/start` 会被并入当前 turn）。非交互：显式传 `approvalPolicy:"never"`、`approvalsReviewer:"user"`、thread 的 `sandbox` 与 turn 的 `sandboxPolicy`，resume 和每个 turn 都要重传；服务端发来的审批请求一律 decline。Role 指令走 `developerInstructions` | threadId 由 codex 生成（见第 2 步）；rollout 在 `$CODEX_HOME/sessions/…/rollout-*-<threadId>.jsonl`；重启后 `thread/resume{threadId}` 续接 | 见上文「用量按增量记账」 |
 | `fake` | 进程内模拟：可配置耗时、结果、失败、挂起、重复回调 | — | 固定值 |
 
-实现前核验：本机 pi 与 codex 版本的 RPC/app-server 消息格式、非交互权限模式（沙箱、自动批准范围）、会话续接方式；用量字段是单次还是累计；续接会话后权限模式是否需要重新传入；是否会读取宿主配置（全局指令文件、自动记忆、连接器/MCP 配置）以及如何关闭——Worker 应只使用 Role 下发的配置（Dapr Agents 的 Claude 执行器默认关闭这些，见 `claude_config.py`）。把核验结论与版本号补进本表。
+**错误分类**（P0-4/5 实测）。pi 没有结构化错误码，只能解析 `errorMessage`（形如 `"<HTTP 状态>: <body>"`，先取前缀状态码）；codex 按 `codexErrorInfo` 枚举：
+
+| Reason | pi 判据 | codex 判据 | Retryable |
+| --- | --- | --- | --- |
+| `auth_required` | 状态 401/403，或含 `invalid (api )?key`、`invalid credential`、`unauthorized` | `unauthorized`，或任意变体中 `httpStatusCode` 为 401/403 | 否 |
+| `budget_exceeded` | 含 `insufficient_quota`、`quota exceeded`、`billing`、`usage limit` 等 | `sessionBudgetExceeded` | 否 |
+| `rate_limited` | 状态 429，或含 `rate.?limit`、`too many requests` | `usageLimitExceeded`、`rateLimitExceeded`（冷却时长可取 `account/rateLimits/read` 的 `resetsAt`） | 是，先触发账号冷却 |
+| `context_too_long` | 上下文溢出文本，或溢出压缩失败 | `contextWindowExceeded` | 否 |
+| `bad_request` | 其他 4xx | `badRequest` 与其他 4xx | 否 |
+| `upstream_unavailable` | 5xx、网络错误、timeout | `serverOverloaded`、`internalServerError`、各类连接或流断开（5xx 或无状态码） | 是 |
+| `sandbox_error` / `policy_blocked` | — | `sandboxError`；`cyberPolicy`、`misalignmentPolicyViolation`、`tooManyDenials` | 否 |
+| `crashed` | stdout EOF 或进程退出而没有 `agent_settled` | 进程退出而没有 `turn/completed` | 是（先按 Recover 处理） |
+
+**宿主配置隔离**（P0-4/5 实测；Worker 只使用 Role 下发的配置）：
+- pi：`PI_CODING_AGENT_DIR=<Role 的 agent 目录>` 整体替换 `~/.pi/agent`（settings、auth、扩展、技能、AGENTS.md 等都从这里读），再加 `PI_OFFLINE=1`、`PI_SKIP_VERSION_CHECK=1`、`PI_TELEMETRY=0`，启动参数 `--no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-mcp --no-approve`。这些参数不会存进会话，**每次启动都要传**。实测 system prompt 中不再出现任何宿主 AGENTS.md / CLAUDE.md、扩展或 MCP 内容。
+- codex：独立的 `HOME` 与 `CODEX_HOME`（只放 `auth.json` 和我们生成的 `config.toml`，**不放 AGENTS.md**——`project_doc_max_bytes=0` 关不掉 CODEX_HOME 里的 AGENTS.md），启动参数 `-c project_doc_max_bytes=0 -c skills.include_instructions=false -c features.plugins=false -c features.hooks=false -c features.apps=false -c features.memories=false`。不设独立 HOME 时，即使 CODEX_HOME 已隔离，仍会注入宿主 `~/.agents/skills`。启动后检查 `thread/start` 响应中的 `instructionSources` 为 `[]` 作为校验。
 
 ### 7.3 凭据
 
-- Pi：模型 provider key 放 Secret，挂载为 `~/.pi/agent/` 下所需文件；`settings.json` 用 ConfigMap。Pi 用 API key，可多副本共享。
-- Codex：每账号一个 StatefulSet（replicas=1），`CODEX_HOME` 指向该 Pod 的 PVC，首次在 Pod 内 `codex login --device-auth` 完成登录，之后由 codex 自行刷新。不复制 OAuth 凭据到多副本；扩容 Codex = 增加账号或改用 API key。
+- Pi：每个 Role 一个 agent 目录（`PI_CODING_AGENT_DIR`），其中 `settings.json` 来自 ConfigMap（含 `retry.enabled:false`，不写 `packages`），provider key 来自 Secret（以环境变量传入，或挂载为该目录下的 `auth.json`）。Pi 用 API key，可多副本共享。
+- Codex：每账号一个 StatefulSet（replicas=1），`HOME` 与 `CODEX_HOME` 都指向该 Pod 的 PVC 内的独立目录，且**必须可写**（codex 会写回刷新后的 `auth.json`，并写 sessions 与本地数据库）。首次登录用设备码：可在 Pod 内执行 `codex login --device-auth`，也可由 Worker 调 app-server 的 `account/login/start {type: "chatgptDeviceCode"}`，把返回的 `verificationUrl` 与 `userCode` 经 Runtime 推送给用户，完成后收到 `account/login/completed`。不复制 OAuth 凭据到多副本；扩容 Codex = 增加账号或改用 API key。沙箱的 `writableRoots` 不包含 CODEX_HOME。
 - Runtime 和 Redis 中只存账号引用，不存令牌正文。凭据目录不挂进执行器的工具可写路径之外的位置（工作区与凭据目录分开挂载）。
 
 ### 7.4 验收
@@ -500,7 +531,7 @@ Goal 完成 = 本轮成功且大脑 `finish`（确定性策略下 `done=true`）
 
 Base：`/v1`，Bearer token（Secret `mybot-api-token`）。所有创建接口要求 `Idempotency-Key` 头。
 
-创建流程（flow F1）：校验请求并固化 `Spec`（角色定义与指令文件 sha256）→ 生成 goalID → `FirstWrite idem:create:<key>`。冲突则回读已有 goalID，**确认对应 Workflow 实例存在，不存在就以该 goalID 补启动**（flow G1），返回 200；写入成功则事务写初始投影（`queued`）+ 索引，再以 goalID 为实例 ID 启动 Workflow，返回 201。初始投影由 API 写，之后投影只由 Activity 写（flow G2）。
+创建流程（flow F1）：校验请求并固化 `Spec`（角色定义与指令文件 sha256）→ 生成 goalID → `FirstWrite idem:create:<key>`。冲突则回读已有 goalID，**确认对应 Workflow 实例存在，不存在就以该 goalID 补启动**（flow G1），返回 200。补启动前必须先用 `FetchWorkflowMetadata` 确认实例不存在（返回 `api.ErrInstanceNotFound`）：实测对**已完成或已终止**的实例 ID 再调 `ScheduleWorkflow` 会返回成功并**重新执行**整个 Goal；只有实例运行中时才返回 `AlreadyExists`（此时当作成功）；写入成功则事务写初始投影（`queued`）+ 索引，再以 goalID 为实例 ID 启动 Workflow，返回 201。初始投影由 API 写，之后投影只由 Activity 写（flow G2）。
 
 控制接口（pause / resume / cancel / append）只向 Workflow 发 `control` 事件，返回 `202 {accepted: true}`，状态变化以事件流为准；对终态 Goal 返回 409（flow G12）。
 
@@ -556,7 +587,9 @@ k3s（单二进制、自带 local-path PVC、Traefik、ServiceLB），单节点�
 | `mybot-worker-pi` | StatefulSet | 1..M | 每 Pod PVC：sessions；共享 hostPath：workspaces、artifacts（rw）、memory（ro） |
 | `mybot-worker-codex-<account>` | StatefulSet | 1 | 每 Pod PVC：sessions + `CODEX_HOME`；共享 hostPath 同上 |
 | `mybot-runtime` 的挂载 | — | — | 共享 hostPath：memory（rw）、artifacts（ro） |
-| Dapr 组件 | `Component` ×2、`Configuration`（开 tracing 采样 0，可选） | — | — |
+| Dapr 组件 | `Component` ×2（`statestore` 设 `keyPrefix: none`）、`Configuration`（开 tracing 采样 0，可选） | — | — |
+| Dapr 控制面 | Helm 安装（runtime 1.18.7） | — | `dapr-scheduler` 必须挂 PVC：Actor reminder 与 Workflow 定时器持久化在 scheduler 中，不在 Redis |
+| `mem0`（集群外） | 无 selector 的 Service + EndpointSlice | — | 指向宿主 docker 网桥地址 `172.17.0.1:8888`（mem0 绑定在 0.0.0.0:8888，宿主局域网 IP 来自 DHCP 会变，不用它）；部署时用一个 curl Pod 验证连通 |
 
 - 共享卷：单节点用 hostPath `/var/lib/mybot/{workspaces,artifacts,memory}`；多节点时改为 RWX 存储（如 NFS）。所有 Worker 进程以同一 UID 运行，目录权限按该 UID 设置。
 - 用户数据（笔记目录等）以 hostPath 只读挂入 Worker，按 Goal `inputs.mounts` 白名单映射；首版白名单写在 Worker 配置里。
@@ -590,7 +623,7 @@ k3s（单二进制、自带 local-path PVC、Traefik、ServiceLB），单节点�
 | **M3 更多大脑与成员** | Claude Code Driver；原生 Go `llm` 执行器（直接调模型 API，只做规划，作为低成本大脑选项）；成员能力描述来自 Agent Card | 第三种执行器担任大脑跑通 M1 的协作 Goal |
 | **M4 扩展入口** | 飞书入口（复用 pi-feishu 经验）；KEDA 评估 | 按需补充 |
 
-M0 开工前先完成四项核验：Dapr Go SDK 的 workflow / actor / state 事务版本组合；a2a-go 版本与扩展 metadata 写法；`pi --mode rpc` 与 `codex app-server` 的消息格式；Dapr Go Workflow SDK 的并发 fan-out/fan-in 写法与外部事件在 `ContinueAsNew` 时的保留行为。结论写回 §6、§7。
+P0 核验已于 2026-10-21 完成，结论已写入 §5.1、§5.2、§5.5、§6、§7、§8、§9.2、§14，锁定版本见 `docs/agents-dot-md/tech-stack.md`。
 
 ## 12. 验收条件
 
@@ -631,6 +664,8 @@ M0 开工前先完成四项核验：Dapr Go SDK 的 workflow / actor / state 事
 | 大脑决策质量 | 不同执行器当大脑时输出格式和规划能力差异大 | 决策 JSON 严格校验 + 回传错误重试；大脑角色指令按执行器微调；`maxStepsPerRound`、预算兜底 |
 | 并行成员写冲突 | 两个成员改同一仓库 | 不同 `workspace` 用独立 worktree，合并由后续轮次的成员（如 reviewer）显式完成；同 workspace 串行 |
 | 记忆污染 | 大脑把一次性结论或错误结论沉淀为长期记忆，后续 Goal 被误导 | 只有大脑能写、单条有长度上限、条目带来源 Goal；用户可直接编辑 / 删除 L1，对账同步到 L2；后续可加「待确认」状态由用户审批 |
+| Dapr 与 durabletask-go 版本 | Workflow 包已移出 go-sdk，改用 `github.com/dapr/durabletask-go/workflow`；Dapr 1.18.7 内置 v0.12.6，没有 `Select` | 用 inbox 单事件名写法（§5.2），不越级升级 durabletask-go；Dapr 1.19 与 go-sdk 1.16 正式发布后整体评估升级 |
+| Redis 作 actor / workflow 存储 | Dapr 警告不建议用于生产；事务失败不回滚 | 顺序写 + 幂等 + 对账（§6）；AOF；24h 浸泡观察；必要时换 PostgreSQL |
 | 第一个场景 | 笔记摘要是验证用例，真实高频场景待定 | M1 完成后由用户确认下一个场景 |
 
 ## 14. 记忆（两层：Markdown + grep，mem0 语义召回）
@@ -681,14 +716,21 @@ L1 与 L2 不是两份独立记忆：同一条事实只在 L1 写一次，L2 只
 
 - **大脑**：提示词带 `[memory index]`（`00-index.md` 全文，上限 8 KiB）和 `[recalled]`（L2 召回结果）；正文由大脑在工作区 `memory/` 下自行 `grep` / 读文件。Runtime 不做关键词抽取（中文分词不可靠），关键词检索交给执行器自己的工具。
 - **成员**：工作区同样只读挂载 `memory/`，提示词只带 `[memory index]`；大脑可在 Step 的 `inputs` 中点名相关主题文件。
-- **L2 召回**：Activity `RecallMemory` 以「Goal 目标 + 本轮大脑上一次 summary」为查询，在 mem0 中检索 `agent_id=my-bot` 的条目 top-5（相似度阈值可配）。结果按条目 ID 回读 L1，只注入 L1 中仍存在的条目，并附 `memory/<topic>.md` 出处；L1 已删除的条目即使 mem0 还在也不注入。
+- **L2 召回**：Activity `RecallMemory` 以「Goal 目标 + 本轮大脑上一次 summary」为查询，在 mem0 中检索 `agent_id=my-bot` 的条目 top-5（请求参数 `top_k: 5`、`threshold: 0.5`，见 14.5）。结果按条目 ID 回读 L1，只注入 L1 中仍存在的条目，并附 `memory/<topic>.md` 出处；L1 已删除的条目即使 mem0 还在也不注入。
 - mem0 超时（2s）或不可用：跳过 `[recalled]`，记 `memory.l2_unavailable` 事件，Goal 照常推进。
 
 ### 14.5 L1 → L2 同步与对账
 
-- 新条目：`MemoryWriter` 写完后，同步任务调用 mem0 add（`infer=false`，正文原样），metadata 带 `{source: "my-bot", entryID, topic, goalID}`，并记录 `memsync:<entryID> = {mem0ID, sha256}` 到 Dapr State。
-- 对账（每 10 分钟，及 Runtime 启动时）：扫描 L1 全部条目，与 `memsync:*` 比较——新增的补 add；文本哈希变化的先 delete 后 add；L1 已删除的从 mem0 删除。用户直接改 Markdown 因此会自动反映到 L2。
-- 实现前核验：自托管 mem0 的 REST 接口（add / search / delete、`infer=false`、按 metadata 过滤）与集群内访问地址；结论写回本节。
+- 新条目：`MemoryWriter` 写完后，同步任务调用 mem0 add（`infer=false`，正文原样），metadata 带 `{source: "my-bot", entryID, topic, goalID}`，并记录 `memsync:<entryID> = {mem0ID, sha256}` 到 Dapr State。mem0 在 `infer=false` 下**不做任何去重**（实测同一文本写两次得到两条），所以 `memsync` 是避免重复的唯一依据。
+- 对账（每 10 分钟，及 Runtime 启动时）：扫描 L1 全部条目，与 `memsync:*` 比较——新增的补 add；文本哈希变化的用 `PUT` 更新（保留同一 mem0 ID，会重新生成向量；metadata 是合并而非替换）；L1 已删除的从 mem0 删除。用户直接改 Markdown 因此会自动反映到 L2。
+- mem0 REST 接口（P0-6 实测）：
+  - 鉴权：请求头 `X-API-Key`，无 key 返回 401。key 不按 user/agent 隔离，任何有效 key 都能读写全部记忆，**my-bot 使用独立的 key**（放 Secret）。
+  - 写入：`POST /memories`，`{messages: [{role: "user", content}], agent_id: "my-bot", infer: false, metadata}`，返回 `results[0].id`。**只写 `agent_id`，不写 `user_id`**，避免混进用户个人记忆按 `user_id` 的召回。
+  - 检索：`POST /search`，`{query, filters: {agent_id: "my-bot", ...}, top_k, threshold}`。条数参数是 `top_k`（传 `limit` 会被静默忽略）；metadata 过滤只能放在 `filters` 中，且必须至少带一个实体 ID（如 `agent_id`），否则返回 400。
+  - 相似度：`threshold` 作用于余弦相似度（0–1，越大越相似），在请求里传；返回的 `score` 是混合分数，不用于截断。实测改写措辞的相关条目 0.57–0.71，无关条目 0.31–0.41，默认阈值 0.5。
+  - 更新：`PUT /memories/{id}`，`{text, metadata}`；删除：`DELETE /memories/{id}`，不存在返回 404；`GET /memories/{id}` 对不存在的 ID 返回 200 加 `null`。
+  - `GET /memories` 只能按实体过滤，默认 20 条、上限 1000、没有分页，对账不依赖它，以 `memsync:*` 为准。
+  - 延迟：add p50 约 470ms，search p50 约 310ms，首次调用可达 1.4s；2s 超时足够。
 
 ### 14.6 部署
 
