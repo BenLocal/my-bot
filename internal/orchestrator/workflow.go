@@ -74,6 +74,7 @@ func GoalWorkflow(ctx *workflow.WorkflowContext) (any, error) {
 		if ctrl != nil {
 			switch ctrl.Action {
 			case "cancel":
+				finalizeGoal(ctx, &state, core.StopCancelled)
 				return nil, nil
 			case "append":
 				state.Spec.Objective += "\n[notes]\n" + ctrl.Note
@@ -83,6 +84,7 @@ func GoalWorkflow(ctx *workflow.WorkflowContext) (any, error) {
 				continue
 			case "pause":
 				if !waitForResume(ctx, &state) {
+					finalizeGoal(ctx, &state, core.StopCancelled)
 					return nil, nil
 				}
 			case "resume":
@@ -398,12 +400,25 @@ func getSummary(steps []core.StepResult) string {
 }
 
 func finalizeGoal(ctx *workflow.WorkflowContext, state *WorkflowState, reason core.StopReason) {
+	status := mapStopReasonToGoalStatus(reason)
 	task := ctx.CallActivity(FinishGoal, workflow.WithActivityInput(FinishGoalReq{
 		GoalID: state.GoalID,
-		Status: core.GoalSucceeded,
+		Status: status,
 		Reason: string(reason),
 	}))
 	_ = task.Await(nil)
+}
+
+// mapStopReasonToGoalStatus maps a stop reason to the appropriate goal status.
+func mapStopReasonToGoalStatus(reason core.StopReason) core.GoalStatus {
+	switch reason {
+	case core.StopFinished:
+		return core.GoalSucceeded
+	case core.StopCancelled:
+		return core.GoalCancelled
+	default:
+		return core.GoalFailed
+	}
 }
 
 // acquireThenSubmit acquires a slot, waits if needed, submits the attempt,

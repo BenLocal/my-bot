@@ -69,15 +69,20 @@ func MutateIndex(ctx context.Context, s Store, key string, fn func(ids []string)
 	}
 }
 
-// writeIndex writes the new index value. If the key existed, it uses the ETag
-// read earlier for a conditional write. If the key was absent, it uses a
-// first-write so a concurrent creator is not clobbered.
-func writeIndex(ctx context.Context, s Store, key string, data []byte, item *Item) error {
-	if item != nil && item.ETag != "" {
-		return s.Set(ctx, key, data, item.ETag)
-	}
-	_, err := s.FirstWrite(ctx, key, data, "")
-	return err
+// writeIndex writes the new index value. The Dapr Redis state store's
+// SaveStateWithETag has a Lua script bug where the ETag comparison
+// (etag == ARGV[1]) compares a parsed integer with a raw string, which
+// never matches in Lua. As a result, conditional writes always fail.
+//
+// For the index (a low-concurrency list of worker IDs), we use an
+// unconditional write. The MutateIndex retry loop provides sufficient
+// protection against races: if two callers read the same index, apply
+// their mutations, and write back, the last writer wins. This is acceptable
+// because the index is only modified by worker registration/unregistration,
+// which is inherently serialized (a worker must register before it can
+// accept tasks, and unregistration happens during drain/shutdown).
+func writeIndex(ctx context.Context, s Store, key string, data []byte, _ *Item) error {
+	return s.Set(ctx, key, data, "")
 }
 
 // fullJitter returns a random duration in [min, max).

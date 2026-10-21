@@ -63,5 +63,5 @@
 
 ## 🧠 记忆索引（docs/memory/，脚本生成）
 <!-- MEMORY:START -->
-- （暂无记忆条目，排查后按 AGENTS.md《记忆记录》的约定追加）
+- [M0 开发决策与排查记录](docs/memory/m0-development-decisions.md) — 记录 M0 阶段关键架构决策、踩坑与修复结论，避免后续会话重新推导。
 <!-- MEMORY:END -->

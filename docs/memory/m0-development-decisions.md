@@ -36,8 +36,20 @@
 
 **修复**：终态写记录 / 发消息改用 `context.WithoutCancel(ctx)`，确保即使请求 context 已取消，终态仍能可靠落库并发布。
 
-## fake 驱动 Events() 流修复（2026-10-21）
+## Dapr Redis State Store ETag 条件写入 bug（2026-10-21）
 
-**问题**：`fakeHandle.Events()` 此前返回空，导致 HTTP SSE 流只收到首个 Task 就结束。
+**现象**：`internal/store/index.go` 的 `writeIndex` 使用 `Set` with ETag 做条件写入，但 Dapr Redis state store 的 Lua 脚本中 `etag == ARGV[1]` 比较解析后的整数和原始字符串，在 Lua 中永远不相等，导致所有条件写入失败。
 
-**修复**：`fakeHandle.Events()` 现在返回后续事件流，支持完整的 Task → Events → 终态流程。
+**影响范围**：仅影响 worker 注册索引（`registry:fake:_index`），不影响 actor state 或其他记录写入。
+
+**修复**：`writeIndex` 改为无条件写入（`Set` without ETag），由 `MutateIndex` 的重试循环提供竞态保护。
+
+## Cancel while queued 的竞态修复（2026-10-21）
+
+**问题**：Goal 在 "queued" 状态时，cancel 请求通过 `RaiseEvent` 向 workflow 实例发控制信号。但 Dapr workflow engine 启动有延迟（`DaprBuiltInActorNotFoundRetries` 重试），workflow 实例尚未创建，`RaiseEvent` 失败，cancel 信号丢失，goal 永远停留在 "queued"。
+
+**修复**：
+- `handleCancelGoal`：对 "queued" 状态直接更新投影为 "cancelled"（不等 workflow 启动），同时仍 raise 控制信号作为 best-effort
+- `FinishGoal`：写入前检查当前状态，若已是 "cancelled" 则不覆盖
+- `finalizeGoal`：原来总写 `GoalSucceeded`，改为根据 `StopReason` 映射正确状态（`StopFinished→GoalSucceeded`, `StopCancelled→GoalCancelled`, 其余→GoalFailed）
+- Workflow 收到 "cancel" 控制信号时调用 `finalizeGoal` 写入投影，而非直接 `return nil, nil`

@@ -270,6 +270,25 @@ func (s *Server) handleCancelGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If the goal is still queued, update the projection directly so the
+	// cancel takes effect without waiting for the workflow engine to start.
+	// The control signal is still raised as a best-effort for the case where
+	// the workflow has already started processing.
+	if proj.Status == core.GoalQueued {
+		cancelledProj := store.GoalProjection{
+			GoalState: core.GoalState{
+				ID:        goalID,
+				Kind:      proj.Kind,
+				Status:    core.GoalCancelled,
+				UpdatedAt: time.Now().UTC(),
+				Budget:    proj.Budget,
+			},
+			EventSeq: proj.EventSeq,
+		}
+		if err := store.SaveGoalProjection(r.Context(), s.store, goalID, cancelledProj); err != nil {
+			s.logger.Warn("cancel goal: direct projection update failed", "goalID", goalID, "error", err)
+		}
+	}
 	s.raiseControlSignal(r, goalID, "cancel", "")
 	s.logger.Info("cancel goal requested", "goalID", goalID, "status", proj.Status)
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})

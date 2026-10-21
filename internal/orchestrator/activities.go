@@ -384,9 +384,17 @@ func FetchWorkflowMetadata(ctx context.Context, goalID string) (bool, error) {
 
 // FinishGoal writes the final goal projection.
 // Leases are reclaimed by the scheduler actor reminder on expiry (M0).
+// If the goal was cancelled while the workflow was running, the cancelled
+// status is preserved (spec §12.9: cancel takes effect while waiting).
 func FinishGoal(ctx context.Context, req FinishGoalReq) error {
 	if depStore == nil {
 		return fmt.Errorf("FinishGoal: store not configured")
+	}
+
+	// Check current status: if already cancelled, don't overwrite.
+	existing, err := store.LoadGoalProjection(ctx, depStore, req.GoalID)
+	if err == nil && existing.Status == core.GoalCancelled {
+		return nil
 	}
 
 	// Write final projection.
@@ -397,6 +405,7 @@ func FinishGoal(ctx context.Context, req FinishGoalReq) error {
 			Status:    req.Status,
 			UpdatedAt: time.Now().UTC(),
 		},
+		EventSeq: existing.EventSeq,
 	}
 	if err := store.SaveGoalProjection(ctx, depStore, req.GoalID, proj); err != nil {
 		return fmt.Errorf("FinishGoal: save projection: %w", err)
