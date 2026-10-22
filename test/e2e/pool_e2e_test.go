@@ -219,6 +219,7 @@ func TestPoolAccountState(t *testing.T) {
 	})
 
 	// Account not ok → queued.
+	pool.SetAccountState("fake/default", false)
 	r1 := pool.Acquire(scheduler.AcquireReq{
 		WaiterInstanceID: "g1",
 		AttemptKey:       "r1:s1:a1",

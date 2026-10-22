@@ -18,8 +18,10 @@ const ActorTypeScheduler = "Scheduler"
 // ActorIDScheduler is the fixed actor ID for the singleton scheduler actor.
 const ActorIDScheduler = "global"
 
-// DefaultLeaseTTL is the default lease TTL for reclaiming stuck leases (M0 = 5m).
-const DefaultLeaseTTL = 5 * time.Minute
+// DefaultLeaseTTL is the safety-net TTL for reclaiming stuck leases. Leases of
+// terminal goals are reclaimed via GoalStatusChecker; the TTL only covers
+// leases whose goal never terminates, so it must exceed any role timeout.
+const DefaultLeaseTTL = 6 * time.Hour
 
 // ReminderName is the name of the periodic reminder.
 const ReminderName = "scheduler-reminder"
@@ -42,15 +44,23 @@ type WorkerProvider interface {
 	Workers(ctx context.Context) (map[string]core.WorkerRecord, error)
 }
 
+// GoalStatusChecker reports whether a goal (waiter instance) is terminal, so
+// the reminder can reclaim its leases and queued requests (docs/spec.md §5.1).
+type GoalStatusChecker interface {
+	GoalTerminal(ctx context.Context, goalID string) (bool, error)
+}
+
 // SchedulerActor is the Dapr actor wrapping the Pool.
 type SchedulerActor struct {
 	actor.ServerImplBaseCtx
 
 	pool              *Pool
 	globalConcurrency int
+	accountLimits     map[string]int
 	store             store.Store
 	deliver           SignalDeliverer
 	workers           WorkerProvider
+	goals             GoalStatusChecker
 	leaseTTL          time.Duration
 	logger            *slog.Logger
 }
@@ -92,6 +102,32 @@ func (a *SchedulerActor) SetSignalDeliverer(d SignalDeliverer) {
 // SetWorkerProvider sets the callback for getting the worker registry.
 func (a *SchedulerActor) SetWorkerProvider(w WorkerProvider) {
 	a.workers = w
+}
+
+// SetGoalStatusChecker sets the checker used by the reminder to reclaim
+// leases of terminal goals.
+func (a *SchedulerActor) SetGoalStatusChecker(c GoalStatusChecker) {
+	a.goals = c
+}
+
+// SetGlobalConcurrency sets the global active lease limit.
+func (a *SchedulerActor) SetGlobalConcurrency(n int) {
+	a.globalConcurrency = n
+	if a.pool != nil {
+		a.pool.SetGlobalConcurrency(n)
+	}
+}
+
+// SetAccountLimits sets per-account concurrency limits keyed by
+// "executor/account"; accounts without an entry have no per-account limit.
+func (a *SchedulerActor) SetAccountLimits(limits map[string]int) {
+	a.accountLimits = make(map[string]int, len(limits))
+	for k, v := range limits {
+		a.accountLimits[k] = v
+	}
+	if a.pool != nil {
+		a.pool.SetAccountLimits(a.accountLimits)
+	}
 }
 
 // refreshWorkers loads the worker registry into the pool.
@@ -138,40 +174,23 @@ func (a *SchedulerActor) loadWorkersFromStore(ctx context.Context) map[string]co
 	return workers
 }
 
-// relaxAffinityWaits clears expired affinity waits on queued requests so they
-// become eligible for any candidate (sessionPolicy=fresh). It is called by the
-// reminder (docs/spec.md §5.1 rule 4).
-func (a *SchedulerActor) relaxAffinityWaits(ctx context.Context) {
-	a.pool.mu.Lock()
-	defer a.pool.mu.Unlock()
-
-	now := time.Now()
-	for _, q := range a.pool.queue {
-		if q.AffinityWait > 0 && now.Sub(q.EnqueuedAt) >= q.AffinityWait {
-			q.PreferWorker = ""
-			q.AffinityWait = 0
-		}
-	}
-}
-
 // ensurePool loads pool state from the actor state store if not yet loaded.
 func (a *SchedulerActor) ensurePool(ctx context.Context) {
 	if a.pool != nil {
 		return
 	}
+	p := NewPool(a.globalConcurrency)
+	p.SetAccountLimits(a.accountLimits)
+	a.pool = p
 	sm := a.GetStateManager()
 	if sm == nil {
-		a.pool = NewPool(a.globalConcurrency)
 		return
 	}
 	var state PoolState
 	if err := sm.Get(ctx, "pool", &state); err != nil {
-		a.pool = NewPool(a.globalConcurrency)
 		return
 	}
-	p := NewPool(a.globalConcurrency)
 	p.DeserializeState(state)
-	a.pool = p
 }
 
 // saveState serializes and saves the pool state.
@@ -207,12 +226,13 @@ type AcquireRespActor struct {
 
 // LeaseActorJSON is the JSON representation of a lease.
 type LeaseActorJSON struct {
-	ID            string `json:"id"`
-	WorkerID      string `json:"workerID"`
-	Executor      string `json:"executor"`
-	Account       string `json:"account"`
-	SessionPolicy string `json:"sessionPolicy"`
-	AcquiredAt    string `json:"acquiredAt"` // RFC3339
+	ID               string `json:"id"`
+	WorkerID         string `json:"workerID"`
+	WaiterInstanceID string `json:"waiterInstanceID,omitempty"`
+	Executor         string `json:"executor"`
+	Account          string `json:"account"`
+	SessionPolicy    string `json:"sessionPolicy"`
+	AcquiredAt       string `json:"acquiredAt"` // RFC3339
 }
 
 // Acquire is the Dapr actor method for acquiring a slot.
@@ -260,15 +280,42 @@ type GrantedLeaseActorJSON struct {
 	Lease      *LeaseActorJSON `json:"lease,omitempty"`
 }
 
-// Release is the Dapr actor method for releasing a lease.
+// Release is the Dapr actor method for releasing a lease or dropping a
+// still-queued request. Idempotent: an unknown attempt key is a no-op.
 func (a *SchedulerActor) Release(ctx context.Context, req ReleaseReqActor) (ReleaseRespActor, error) {
 	a.ensurePool(ctx)
+	a.refreshWorkers(ctx)
 
 	granted, err := a.pool.Release(req.AttemptKey)
 	if err != nil {
 		return ReleaseRespActor{}, err
 	}
+	a.deliverGrants(ctx, granted)
 
+	a.saveState(ctx)
+	return grantsToActorJSON(granted), nil
+}
+
+// ReleaseWaiterReqActor is the JSON request for the ReleaseWaiter actor method.
+type ReleaseWaiterReqActor struct {
+	InstanceID string `json:"instanceID"`
+}
+
+// ReleaseWaiter is the Dapr actor method that releases every lease and queued
+// request of a goal (used on cancel / finish).
+func (a *SchedulerActor) ReleaseWaiter(ctx context.Context, req ReleaseWaiterReqActor) (ReleaseRespActor, error) {
+	a.ensurePool(ctx)
+	a.refreshWorkers(ctx)
+
+	granted := a.pool.ReleaseWaiter(req.InstanceID)
+	a.deliverGrants(ctx, granted)
+
+	a.saveState(ctx)
+	return grantsToActorJSON(granted), nil
+}
+
+// grantsToActorJSON converts granted leases to the Release response.
+func grantsToActorJSON(granted []GrantedLease) ReleaseRespActor {
 	out := ReleaseRespActor{}
 	for _, g := range granted {
 		out.GrantedLeases = append(out.GrantedLeases, GrantedLeaseActorJSON{
@@ -277,10 +324,7 @@ func (a *SchedulerActor) Release(ctx context.Context, req ReleaseReqActor) (Rele
 			Lease:      leaseToActorJSON(g.Lease),
 		})
 	}
-	a.deliverGrants(ctx, granted)
-
-	a.saveState(ctx)
-	return out, nil
+	return out
 }
 
 // CooldownReqActor is the JSON request for the Cooldown actor method.
@@ -333,6 +377,7 @@ func (a *SchedulerActor) Drain(ctx context.Context, req DrainReqActor) error {
 // Snapshot is the Dapr actor method for returning the current pool state.
 func (a *SchedulerActor) Snapshot(ctx context.Context) (SchedulerView, error) {
 	a.ensurePool(ctx)
+	a.refreshWorkers(ctx)
 	return a.pool.Snapshot(), nil
 }
 
@@ -359,7 +404,8 @@ func (a *SchedulerActor) ReminderCall(name string, state []byte, dueTime string,
 	ctx := context.Background()
 	a.ensurePool(ctx)
 	a.refreshWorkers(ctx)
-	a.relaxAffinityWaits(ctx)
+
+	a.reclaimTerminalGoals(ctx)
 
 	granted := a.pool.ReclaimExpired(a.leaseTTL)
 	a.deliverGrants(ctx, granted)
@@ -368,6 +414,29 @@ func (a *SchedulerActor) ReminderCall(name string, state []byte, dueTime string,
 	a.deliverGrants(ctx, queueGranted)
 
 	a.saveState(ctx)
+}
+
+// reclaimTerminalGoals releases leases and queued requests of goals that are
+// already terminal. Queued requests whose affinity wait expired are relaxed by
+// the pool itself when the queue is retried.
+func (a *SchedulerActor) reclaimTerminalGoals(ctx context.Context) {
+	if a.goals == nil {
+		return
+	}
+	var terminalIDs []string
+	for _, id := range a.pool.WaiterInstanceIDs() {
+		terminal, err := a.goals.GoalTerminal(ctx, id)
+		if err != nil {
+			a.logWarn("check goal status failed", "goalID", id, "error", err)
+			continue
+		}
+		if terminal {
+			terminalIDs = append(terminalIDs, id)
+		}
+	}
+	if len(terminalIDs) > 0 {
+		a.deliverGrants(ctx, a.pool.ReleaseWaiter(terminalIDs...))
+	}
 }
 
 // deliverGrants sends slot-granted signals for newly granted queued requests.
@@ -388,12 +457,13 @@ func leaseToActorJSON(l *Lease) *LeaseActorJSON {
 		return nil
 	}
 	return &LeaseActorJSON{
-		ID:            l.ID,
-		WorkerID:      l.WorkerID,
-		Executor:      l.Executor,
-		Account:       l.Account,
-		SessionPolicy: l.SessionPolicy,
-		AcquiredAt:    l.AcquiredAt.Format(time.RFC3339),
+		ID:               l.ID,
+		WorkerID:         l.WorkerID,
+		WaiterInstanceID: l.WaiterInstanceID,
+		Executor:         l.Executor,
+		Account:          l.Account,
+		SessionPolicy:    l.SessionPolicy,
+		AcquiredAt:       l.AcquiredAt.Format(time.RFC3339),
 	}
 }
 
@@ -404,12 +474,13 @@ func leaseFromActorJSON(l *LeaseActorJSON) *Lease {
 	}
 	acquired, _ := time.Parse(time.RFC3339, l.AcquiredAt)
 	return &Lease{
-		ID:            l.ID,
-		WorkerID:      l.WorkerID,
-		Executor:      l.Executor,
-		Account:       l.Account,
-		SessionPolicy: l.SessionPolicy,
-		AcquiredAt:    acquired,
+		ID:               l.ID,
+		WorkerID:         l.WorkerID,
+		WaiterInstanceID: l.WaiterInstanceID,
+		Executor:         l.Executor,
+		Account:          l.Account,
+		SessionPolicy:    l.SessionPolicy,
+		AcquiredAt:       acquired,
 	}
 }
 
