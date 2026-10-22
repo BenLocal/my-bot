@@ -1,367 +1,397 @@
 //go:build e2e
 
-// Package e2e contains integration tests that start Dapr, Runtime, and fake
-// Workers to verify §12 end-to-end use cases. These tests require a running
-// Dapr sidecar and are run with: go test -tags e2e ./test/e2e/
 package e2e
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
-// integrationEnv manages the lifecycle of Dapr, Runtime, and Worker processes
-// for integration tests.
-type integrationEnv struct {
-	t          *testing.T
-	redisPID   string
-	daprdPID   string
-	runtimePID string
-	workerPIDs []string
-	httpBase   string
-}
-
-// startIntegration launches Redis, Dapr, Runtime, and N fake Workers.
-// It skips the test if Redis or Dapr binaries are not available.
-func startIntegration(t *testing.T, numWorkers int) *integrationEnv {
-	t.Helper()
-	env := &integrationEnv{t: t, httpBase: "http://localhost:8080"}
-
-	// Check prerequisites.
-	if err := exec.Command("redis-server", "--version").Run(); err != nil {
-		t.Skip("redis-server not available, skipping integration test")
+// §12.1：提交 Task 后客户端即断开，任务仍完成，结果可查询。
+func TestE2E_TaskCompletesWithoutClient(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 2})
+	code, id := e.create("/tasks", map[string]any{"objective": "summarise notes", "members": []string{"assistant"}}, "")
+	if code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", code)
 	}
-	if err := exec.Command("daprd", "--version").Run(); err != nil {
-		t.Skip("daprd not available, skipping integration test")
+	g := e.waitStatus(id, 60*time.Second, "succeeded", "failed")
+	if g.Status != "succeeded" || g.Round != 1 {
+		t.Fatalf("task: status=%s round=%d reason=%s", g.Status, g.Round, g.Reason)
 	}
-
-	// Kill any stale Redis from previous test runs.
-	exec.Command("pkill", "-f", "redis-server.*6379").Run()
-
-	// Start Redis.
-	redisCmd := exec.Command("redis-server", "--port", "6379", "--daemonize", "no")
-	redisCmd.Stdout = os.Stdout
-	redisCmd.Stderr = os.Stderr
-	if err := redisCmd.Start(); err != nil {
-		t.Fatalf("failed to start Redis: %v", err)
+	var round struct {
+		Status string `json:"status"`
+		Steps  []struct {
+			Summary string `json:"summary"`
+		} `json:"steps"`
 	}
-	env.redisPID = fmt.Sprintf("%d", redisCmd.Process.Pid)
-
-	// Wait for Redis.
-	waitForPort(t, "localhost:6379", 5*time.Second)
-
-	// Start Dapr sidecar via dapr run (standard standalone mode, starts placement internally).
-	daprdCmd := exec.Command("dapr", "run",
-		"--app-id", "mybot-runtime",
-		"--dapr-http-port", "3500",
-		"--dapr-grpc-port", "50001",
-		"--resources-path", "../../deploy/dapr/local",
-		"--config", "../../deploy/dapr/local/config.yaml",
-		"--app-port", "8080",
-		"--app-protocol", "http",
-	)
-	daprdCmd.Stdout = os.Stdout
-	daprdCmd.Stderr = os.Stderr
-	if err := daprdCmd.Start(); err != nil {
-		t.Fatalf("failed to start daprd: %v", err)
+	if e.getJSON("/goals/"+id+"/rounds/1", &round) != http.StatusOK || round.Status != "succeeded" || len(round.Steps) != 1 || round.Steps[0].Summary != "ok" {
+		t.Fatalf("round 1 detail: %+v", round)
 	}
-	env.daprdPID = fmt.Sprintf("%d", daprdCmd.Process.Pid)
-
-	// Wait for Dapr.
-	waitForPort(t, "localhost:3500", 10*time.Second)
-
-	// Build binaries.
-	goEnv := os.Environ()
-	goEnv = append(goEnv,
-		"GOCACHE=/tmp/go-cache",
-		"GOMODCACHE=/tmp/go-mod-cache",
-		"GOPATH=/tmp/go-path",
-	)
-	buildCmd := exec.Command("go", "build", "-o", "/tmp/mybot-runtime", "./cmd/mybot-runtime")
-	buildCmd.Env = goEnv
-	buildCmd.Dir = "../../"
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build runtime: %v: %s", err, out)
-	}
-	buildCmd = exec.Command("go", "build", "-o", "/tmp/mybot-worker", "./cmd/mybot-worker")
-	buildCmd.Env = goEnv
-	buildCmd.Dir = "../../"
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to build worker: %v: %s", err, out)
-	}
-
-	// Start Runtime.
-	runtimeCmd := exec.Command("/tmp/mybot-runtime",
-		"--port", "8080",
-		"--actor-port", "8081",
-		"--dapr-port", "50001",
-		"--global-max", "2",
-	)
-	runtimeCmd.Stdout = os.Stdout
-	runtimeCmd.Stderr = os.Stderr
-	if err := runtimeCmd.Start(); err != nil {
-		t.Fatalf("failed to start runtime: %v", err)
-	}
-	env.runtimePID = fmt.Sprintf("%d", runtimeCmd.Process.Pid)
-
-	// Wait for Runtime.
-	waitForPort(t, "localhost:8080", 10*time.Second)
-
-	// Start Workers.
-	for i := 1; i <= numWorkers; i++ {
-		port := 9100 + i
-		workerCmd := exec.Command("/tmp/mybot-worker",
-			"--addr", fmt.Sprintf(":%d", port),
-			"--executor", "fake",
-			"--account", "default",
-			"--capacity", "2",
-			"--store-addr", "localhost:50001",
-			"--store-name", "statestore",
-			"--pubsub-name", "pubsub",
-		)
-		workerCmd.Stdout = os.Stdout
-		workerCmd.Stderr = os.Stderr
-		if err := workerCmd.Start(); err != nil {
-			t.Fatalf("failed to start worker %d: %v", i, err)
+	evs := e.events(id)
+	for _, typ := range []string{"goal.created", "round.started", "attempt.submitted", "attempt.finished", "goal.finished"} {
+		if countEvents(evs, typ) == 0 {
+			t.Errorf("missing event %s in %+v", typ, evs)
 		}
-		env.workerPIDs = append(env.workerPIDs, fmt.Sprintf("%d", workerCmd.Process.Pid))
-		waitForPort(t, fmt.Sprintf("localhost:%d", port), 5*time.Second)
 	}
-
-	// Give workers time to register.
-	time.Sleep(3 * time.Second)
-
-	return env
 }
 
-// stopIntegration kills all processes started by startIntegration.
-func (e *integrationEnv) stopIntegration() {
-	for _, pid := range e.workerPIDs {
-		exec.Command("kill", pid).Run()
+// §12.2：同一 Idempotency-Key 只得到一个 Goal；同一 Step 只提交一次。
+func TestE2E_Idempotency(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1})
+	spec := map[string]any{"objective": "idempotent", "members": []string{"assistant"}}
+	c1, id1 := e.create("/tasks", spec, "idem-1")
+	c2, id2 := e.create("/tasks", spec, "idem-1")
+	if c1 != http.StatusCreated || c2 != http.StatusOK || id1 != id2 {
+		t.Fatalf("idempotent create: (%d,%s) (%d,%s)", c1, id1, c2, id2)
 	}
-	exec.Command("kill", e.runtimePID).Run()
-	exec.Command("kill", e.daprdPID).Run()
-	exec.Command("kill", e.redisPID).Run()
+	e.waitStatus(id1, 60*time.Second, "succeeded")
+	if n := countEvents(e.events(id1), "attempt.submitted"); n != 1 {
+		t.Fatalf("expected exactly 1 attempt.submitted, got %d", n)
+	}
+	var all []goalView
+	e.getJSON("/goals?status=all", &all)
+	if len(all) != 1 {
+		t.Fatalf("expected 1 goal in index, got %d", len(all))
+	}
 }
 
-// createGoal creates a goal via the API and returns the goal ID.
-func (e *integrationEnv) createGoal(spec map[string]any) string {
-	e.t.Helper()
-	body, _ := json.Marshal(spec)
-	req, _ := http.NewRequest("POST", e.httpBase+"/goals", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Idempotency-Key", "test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		e.t.Fatalf("create goal request failed: %v", err)
+// §12.3：并发上限 2（roles.fake.yaml）时 3 个 Goal：活跃 lease ≤ 2，第三个出现 slot.waiting 后完成。
+func TestE2E_ConcurrencyLimit(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 2, capacity: 4})
+	slow := fakeObjective("slow task", map[string]any{"delay": "6s", "result": memberResult("ok", true)})
+	var ids []string
+	for i := 0; i < 3; i++ {
+		_, id := e.create("/tasks", map[string]any{"objective": slow, "members": []string{"assistant"}}, "")
+		ids = append(ids, id)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		out, _ := io.ReadAll(resp.Body)
-		e.t.Fatalf("create goal failed: status=%d body=%s", resp.StatusCode, out)
-	}
-
-	var result struct {
-		GoalID string `json:"goalID"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		e.t.Fatalf("decode response: %v", err)
-	}
-	return result.GoalID
-}
-
-// getGoal fetches the current goal projection.
-func (e *integrationEnv) getGoal(goalID string) map[string]any {
-	e.t.Helper()
-	resp, err := http.Get(e.httpBase + "/goals/" + goalID)
-	if err != nil {
-		e.t.Fatalf("get goal request failed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		e.t.Fatalf("get goal failed: status=%d", resp.StatusCode)
-	}
-	var result map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		e.t.Fatalf("decode response: %v", err)
-	}
-	return result
-}
-
-// waitForGoalStatus polls until the goal reaches a terminal status or times out.
-func (e *integrationEnv) waitForGoalStatus(goalID string, statuses []string, timeout time.Duration) map[string]any {
-	e.t.Helper()
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(90 * time.Second)
+	maxActive := 0
 	for time.Now().Before(deadline) {
-		g := e.getGoal(goalID)
-		status, _ := g["status"].(string)
-		for _, s := range statuses {
-			if status == s {
-				return g
+		var ws workersView
+		if e.getJSON("/workers", &ws) == http.StatusOK && ws.Scheduler != nil && ws.Scheduler.ActiveLeases > maxActive {
+			maxActive = ws.Scheduler.ActiveLeases
+		}
+		done := 0
+		for _, id := range ids {
+			if s := e.goal(id).Status; s == "succeeded" || s == "failed" {
+				done++
 			}
 		}
-		time.Sleep(1 * time.Second)
-	}
-	e.t.Fatalf("goal %s did not reach status %v within %v", goalID, statuses, timeout)
-	return nil
-}
-
-// waitForPort waits until a TCP port is accepting connections.
-func waitForPort(t *testing.T, addr string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
-		if err == nil {
-			conn.Close()
-			return
+		if done == len(ids) {
+			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatalf("port %s not reachable within %v", addr, timeout)
+	if maxActive > 2 {
+		t.Fatalf("active leases exceeded global limit: %d", maxActive)
+	}
+	waited := 0
+	for _, id := range ids {
+		if g := e.goal(id); g.Status != "succeeded" {
+			t.Fatalf("goal %s: %s (%s)", id, g.Status, g.Reason)
+		}
+		waited += countEvents(e.events(id), "slot.waiting")
+	}
+	if waited == 0 {
+		t.Fatal("expected at least one slot.waiting event")
+	}
 }
 
-// TestE2E_SingleGoalCompletes verifies §12.1: a goal submitted via API
-// completes end-to-end.
-func TestE2E_SingleGoalCompletes(t *testing.T) {
-	env := startIntegration(t, 2)
-	defer env.stopIntegration()
-
-	goalID := env.createGoal(map[string]any{
-		"kind":      "goal",
-		"objective": "Write a hello world program",
-		"strategy":  "single",
-		"limits": map[string]any{
-			"maxRounds": 3,
-		},
-	})
-
-	t.Logf("created goal %s", goalID)
-
-	// Wait for the goal to complete.
-	g := env.waitForGoalStatus(goalID, []string{"succeeded", "failed", "cancelled"}, 60*time.Second)
-	t.Logf("goal status: %v", g["status"])
+// §12.4：执行中重启 Runtime：轮次与预算不变，Attempt 被重新关联，不产生新会话。
+func TestE2E_RuntimeRestart(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1})
+	obj := fakeObjective("long task", map[string]any{"delay": "15s", "result": memberResult("ok", true), "usage": map[string]any{"inputTokens": 10, "outputTokens": 5}})
+	_, id := e.create("/tasks", map[string]any{"objective": obj, "members": []string{"assistant"}}, "")
+	e.waitEvent(id, "attempt.submitted", 30*time.Second)
+	e.restartRuntime()
+	g := e.waitStatus(id, 90*time.Second, "succeeded", "failed")
+	if g.Status != "succeeded" || g.Round != 1 || g.Budget.TokensUsed != 15 {
+		t.Fatalf("after restart: %+v", g)
+	}
+	if n := countEvents(e.events(id), "attempt.submitted"); n != 1 {
+		t.Fatalf("expected 1 attempt.submitted (no new session), got %d", n)
+	}
 }
 
-// TestE2E_ConcurrencyLimit verifies §12.3: global concurrency limit is enforced.
-func TestE2E_ConcurrencyLimit(t *testing.T) {
-	env := startIntegration(t, 2)
-	defer env.stopIntegration()
-
-	// Create 3 goals with global=2.
-	var goalIDs []string
-	for i := 0; i < 3; i++ {
-		goalID := env.createGoal(map[string]any{
-			"kind":      "goal",
-			"objective": fmt.Sprintf("Task %d: do something", i),
-			"strategy":  "single",
-			"limits": map[string]any{
-				"maxRounds": 5,
-			},
-		})
-		goalIDs = append(goalIDs, goalID)
+// §12.5：执行中重启 Worker：Attempt 记 interrupted，按重试规则在本轮内重试并完成。
+func TestE2E_WorkerRestart(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1})
+	obj := fakeObjective("worker restart", map[string]any{"delay": "15s", "result": memberResult("ok", true)})
+	_, id := e.create("/tasks", map[string]any{"objective": obj, "members": []string{"assistant"}}, "")
+	e.waitEvent(id, "attempt.submitted", 30*time.Second)
+	e.restartWorker("w1")
+	g := e.waitStatus(id, 120*time.Second, "succeeded", "failed")
+	if g.Status != "succeeded" {
+		t.Fatalf("goal after worker restart: %+v", g)
 	}
-
-	// Check that at least one goal is still running after a short wait.
-	time.Sleep(5 * time.Second)
-	running := 0
-	for _, id := range goalIDs {
-		g := env.getGoal(id)
-		status, _ := g["status"].(string)
-		if status == "running" || status == "queued" {
-			running++
+	evs := e.events(id)
+	interrupted := false
+	for _, ev := range eventsOf(evs, "attempt.finished") {
+		if ev.Data["status"] == "interrupted" {
+			interrupted = true
 		}
 	}
-	if running == 0 {
-		t.Logf("all goals completed (concurrency may have been fast enough)")
+	if !interrupted || countEvents(evs, "attempt.submitted") != 2 {
+		t.Fatalf("expected interrupted attempt then a retry, events: %+v", evs)
 	}
 }
 
-// TestE2E_CancelGoal verifies §12.9: cancel takes effect while waiting.
-func TestE2E_CancelGoal(t *testing.T) {
-	env := startIntegration(t, 2)
-	defer env.stopIntegration()
+// brainScript builds a byRound fake script for the brain.
+func brainScript(rounds map[int]any) map[string]any {
+	byRound := map[string]any{}
+	for n, decision := range rounds {
+		byRound[fmt.Sprint(n)] = map[string]any{"delay": "1s", "result": mustJSON(decision)}
+	}
+	return map[string]any{"byRound": byRound}
+}
 
-	goalID := env.createGoal(map[string]any{
-		"kind":      "goal",
-		"objective": "A long running task",
-		"strategy":  "single",
-		"limits": map[string]any{
-			"maxRounds": 10,
-		},
+func memberStep(id, role string, delay string, artifact string) map[string]any {
+	script := map[string]any{"delay": delay, "result": memberResult(id+" done", true)}
+	if artifact != "" {
+		script["artifacts"] = []map[string]any{{"name": artifact, "content": id + " output"}}
+	}
+	return map[string]any{"id": id, "role": role, "instruction": fakeObjective("do "+id, script)}
+}
+
+// §12.12：大脑一次派出 2 个成员并行执行，结果与产物在下一轮可见。
+func TestE2E_BrainParallel(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 2})
+	brain := brainScript(map[int]any{
+		1: map[string]any{"action": "dispatch", "summary": "design and test in parallel", "steps": []any{
+			memberStep("impl", "coder", "4s", "impl.txt"),
+			memberStep("tests", "reviewer", "4s", "tests.txt"),
+		}},
+		2: map[string]any{"action": "finish", "done": true, "summary": "all done"},
 	})
+	_, id := e.create("/goals", map[string]any{
+		"objective": fakeObjective("build it", brain),
+		"strategy":  "brain", "brain": "planner", "members": []string{"coder", "reviewer"},
+		"limits": map[string]any{"maxRounds": 4},
+	}, "")
+	g := e.waitStatus(id, 90*time.Second, "succeeded", "failed")
+	if g.Status != "succeeded" || g.Round != 2 {
+		t.Fatalf("brain goal: %+v", g)
+	}
+	// 并行：两个成员都在任一成员结束前提交。
+	evs := e.events(id)
+	submittedMembers, firstMemberFinish := 0, -1
+	for i, ev := range evs {
+		step, _ := ev.Data["stepID"].(string)
+		if step != "impl" && step != "tests" {
+			continue
+		}
+		if ev.Type == "attempt.submitted" && firstMemberFinish < 0 {
+			submittedMembers++
+		}
+		if ev.Type == "attempt.finished" && firstMemberFinish < 0 {
+			firstMemberFinish = i
+		}
+	}
+	if submittedMembers != 2 {
+		t.Fatalf("members did not run in parallel: %+v", evs)
+	}
+	// 产物已登记并可下载（sha256 校验）。
+	for _, art := range []string{"r1/impl/impl.txt", "r1/tests/tests.txt"} {
+		code, body := e.do("GET", "/goals/"+id+"/artifacts/"+strings.Replace(art, "r1/", "1/", 1), nil, nil)
+		if code != http.StatusOK || !bytes.Contains(body, []byte("output")) {
+			t.Fatalf("artifact %s: %d %s", art, code, body)
+		}
+	}
+}
 
-	// Wait a moment then cancel.
-	time.Sleep(2 * time.Second)
-	req, _ := http.NewRequest("POST", env.httpBase+"/goals/"+goalID+"/cancel", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("cancel request failed: %v", err)
+// §12.13：非成员角色 / 不存在的产物 / 超出 maxStepsPerRound 被拒绝并把原因回传大脑。
+func TestE2E_InvalidDecisionRejected(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1})
+	bad := map[string]any{"action": "dispatch", "summary": "bad", "steps": []any{
+		map[string]any{"id": "a", "role": "hacker", "instruction": "x"},
+		map[string]any{"id": "b", "role": "coder", "instruction": "x", "inputs": []string{"r9/nope/file.md"}},
+		map[string]any{"id": "c", "role": "coder", "instruction": "x"},
+	}}
+	brain := brainScript(map[int]any{1: bad, 2: map[string]any{"action": "finish", "done": true, "summary": "ok"}})
+	_, id := e.create("/goals", map[string]any{
+		"objective": fakeObjective("validate", brain),
+		"strategy":  "brain", "brain": "planner", "members": []string{"coder"},
+		"limits": map[string]any{"maxRounds": 4, "maxStepsPerRound": 2},
+	}, "")
+	g := e.waitStatus(id, 90*time.Second, "succeeded", "failed")
+	evs := e.events(id)
+	rejected := eventsOf(evs, "decision.rejected")
+	if len(rejected) != 2 {
+		t.Fatalf("expected 2 decision.rejected (2 tries in round 1), got %d: %+v", len(rejected), evs)
+	}
+	fb, _ := rejected[0].Data["feedback"].(string)
+	for _, rule := range []string{"[R1]", "[R2]", "[R3]"} {
+		if !strings.Contains(fb, rule) {
+			t.Errorf("feedback missing %s: %s", rule, fb)
+		}
+	}
+	if countEvents(evs, "attempt.submitted") != 3 { // brain, brain-2, round-2 brain；成员从未派发
+		t.Errorf("unexpected submissions: %+v", eventsOf(evs, "attempt.submitted"))
+	}
+	if g.Status != "succeeded" {
+		t.Fatalf("goal: %+v", g)
+	}
+}
+
+// §12.13：大脑 ask_user → waiting；错误的 replyTo 返回 409；正确回答后继续完成。
+func TestE2E_AskUser(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1})
+	brain := brainScript(map[int]any{
+		1: map[string]any{"action": "ask_user", "question": "which db?", "summary": "need input"},
+		2: map[string]any{"action": "finish", "done": true, "summary": "done"},
+	})
+	_, id := e.create("/goals", map[string]any{
+		"objective": fakeObjective("ask", brain),
+		"strategy":  "brain", "brain": "planner", "members": []string{"coder"},
+		"limits": map[string]any{"maxRounds": 4},
+	}, "")
+	g := e.waitStatus(id, 60*time.Second, "waiting")
+	if g.Ask == nil || g.Ask.Question != "which db?" {
+		t.Fatalf("waiting without ask: %+v", g)
+	}
+	if code, _ := e.do("POST", "/goals/"+id+":append", map[string]any{"note": "x", "replyTo": "ask:wrong"}, nil); code != http.StatusConflict {
+		t.Fatalf("wrong replyTo: expected 409, got %d", code)
+	}
+	if code, body := e.do("POST", "/goals/"+id+":append", map[string]any{"note": "postgres", "replyTo": g.Ask.RequestID}, nil); code != http.StatusAccepted {
+		t.Fatalf("reply: %d %s", code, body)
+	}
+	if g = e.waitStatus(id, 60*time.Second, "succeeded", "failed"); g.Status != "succeeded" {
+		t.Fatalf("after reply: %+v", g)
+	}
+	if code, _ := e.do("POST", "/goals/"+id+":append", map[string]any{"note": "late"}, nil); code != http.StatusConflict {
+		t.Fatalf("append on terminal goal: expected 409, got %d", code)
+	}
+}
+
+// §12.18：idem 写入后、启动 Workflow 前崩溃：同 key 重试返回同一 ID，并补启动完成。
+func TestE2E_CreateCrashWindow(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1})
+	const goalID = "g_01CRASHWINDOWE2E000000000"
+	// 模拟崩溃：只有 idem 记录（与 CreateIdem 一样以 first-write 写入，值为 JSON 字符串 goalID），没有投影 / 实例。
+	body := fmt.Sprintf(`[{"key":"idem:create:crash-1","value":%q,"options":{"concurrency":"first-write"}}]`, goalID)
+	resp, err := http.Post(daprHTTPBase+"/v1.0/state/statestore", "application/json", strings.NewReader(body))
+	if err != nil || resp.StatusCode/100 != 2 {
+		t.Fatalf("seed idem record: %v %v", err, resp)
 	}
 	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("cancel should return 202, got %d", resp.StatusCode)
+	code, id := e.create("/tasks", map[string]any{"objective": "after crash", "members": []string{"assistant"}}, "crash-1")
+	if code != http.StatusOK || id != goalID {
+		t.Fatalf("expected 200 with %s, got %d %s", goalID, code, id)
 	}
-
-	g := env.waitForGoalStatus(goalID, []string{"cancelled"}, 30*time.Second)
-	t.Logf("goal cancelled: %v", g["status"])
+	if g := e.waitStatus(id, 60*time.Second, "succeeded", "failed"); g.Status != "succeeded" {
+		t.Fatalf("re-scheduled goal: %+v", g)
+	}
 }
 
-// TestE2E_WorkerRegistration verifies that workers are visible via the API.
-func TestE2E_WorkerRegistration(t *testing.T) {
-	env := startIntegration(t, 2)
-	defer env.stopIntegration()
+// §12.19：等槽位、等 Attempt 时 cancel 立即生效，运行中的 Attempt 被取消，lease 全部释放。
+func TestE2E_CancelWhileWaiting(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 1, capacity: 4})
+	hang := fakeObjective("hang", map[string]any{"hang": true})
+	var running []string
+	for i := 0; i < 2; i++ {
+		_, id := e.create("/tasks", map[string]any{"objective": hang, "members": []string{"assistant"}}, "")
+		running = append(running, id)
+		e.waitEvent(id, "attempt.submitted", 30*time.Second)
+	}
+	_, queued := e.create("/tasks", map[string]any{"objective": hang, "members": []string{"assistant"}}, "")
+	e.waitEvent(queued, "slot.waiting", 30*time.Second)
 
-	resp, err := http.Get(env.httpBase + "/workers")
-	if err != nil {
-		t.Fatalf("workers request failed: %v", err)
+	start := time.Now()
+	for _, id := range append([]string{queued}, running...) {
+		if code, body := e.do("POST", "/goals/"+id+":cancel", nil, nil); code != http.StatusAccepted {
+			t.Fatalf("cancel %s: %d %s", id, code, body)
+		}
 	}
-	defer resp.Body.Close()
-
-	var result struct {
-		Workers []map[string]any `json:"workers"`
+	for _, id := range append([]string{queued}, running...) {
+		e.waitStatus(id, 20*time.Second, "cancelled")
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("decode response: %v", err)
+	if time.Since(start) > 20*time.Second {
+		t.Fatalf("cancel took %v", time.Since(start))
 	}
-
-	if len(result.Workers) < 2 {
-		t.Fatalf("expected at least 2 workers, got %d", len(result.Workers))
-	}
-	t.Logf("found %d workers", len(result.Workers))
+	eventually(t, 20*time.Second, func() bool {
+		var ws workersView
+		return e.getJSON("/workers", &ws) == http.StatusOK && ws.Scheduler != nil && ws.Scheduler.ActiveLeases == 0 && ws.Scheduler.Queued == 0
+	}, "all leases released")
 }
 
-// TestE2E_BrainStrategy verifies §12.12: brain strategy with parallel members.
-func TestE2E_BrainStrategy(t *testing.T) {
-	env := startIntegration(t, 2)
-	defer env.stopIntegration()
+// §12.20：永久停掉一个 Worker：orphanAfter 后 Attempt 判 interrupted(worker_lost)，在另一个 Worker 上重试。
+func TestE2E_OrphanAttempt(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 2})
+	obj := fakeObjective("orphan", map[string]any{"delay": "20s", "result": memberResult("ok", true)})
+	_, id := e.create("/tasks", map[string]any{"objective": obj, "members": []string{"assistant"}, "limits": map[string]any{"orphanAfter": "10s"}}, "")
+	sub := e.waitEvent(id, "attempt.submitted", 30*time.Second)
+	victim, _ := sub.Data["workerID"].(string)
+	e.killWorker(victim, true)
 
-	goalID := env.createGoal(map[string]any{
-		"kind":      "goal",
-		"objective": "Build a simple web app",
-		"strategy":  "brain",
-		"brain":     "default",
-		"members":   []string{"coder", "reviewer"},
-		"limits": map[string]any{
-			"maxRounds": 5,
-		},
+	g := e.waitStatus(id, 4*time.Minute, "succeeded", "failed")
+	evs := e.events(id)
+	lost := false
+	for _, ev := range eventsOf(evs, "attempt.finished") {
+		if ev.Data["reason"] == "worker_lost" {
+			lost = true
+		}
+	}
+	subs := eventsOf(evs, "attempt.submitted")
+	if !lost || len(subs) != 2 || subs[1].Data["workerID"] == victim || g.Status != "succeeded" {
+		t.Fatalf("orphan handling: status=%s events=%+v", g.Status, evs)
+	}
+}
+
+// §12.21（reuse 部分）：大脑第二轮被派回同一 Worker 并复用会话；满载超时放宽见 scheduler 单测。
+func TestE2E_SessionAffinity(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 2})
+	brain := brainScript(map[int]any{
+		1: map[string]any{"action": "dispatch", "summary": "step 1", "steps": []any{memberStep("a", "coder", "1s", "")}},
+		2: map[string]any{"action": "dispatch", "summary": "step 2", "steps": []any{memberStep("b", "coder", "1s", "")}},
+		3: map[string]any{"action": "finish", "done": true, "summary": "done"},
 	})
+	_, id := e.create("/goals", map[string]any{
+		"objective": fakeObjective("affinity", brain),
+		"strategy":  "brain", "brain": "planner", "members": []string{"coder"},
+		"limits": map[string]any{"maxRounds": 5},
+	}, "")
+	e.waitStatus(id, 90*time.Second, "succeeded")
+	var brainSubs []eventView
+	for _, ev := range eventsOf(e.events(id), "attempt.submitted") {
+		if ev.Data["stepID"] == "brain" {
+			brainSubs = append(brainSubs, ev)
+		}
+	}
+	if len(brainSubs) != 3 {
+		t.Fatalf("expected 3 brain submissions, got %+v", brainSubs)
+	}
+	for _, ev := range brainSubs[1:] {
+		if ev.Data["workerID"] != brainSubs[0].Data["workerID"] || ev.Data["sessionPolicy"] != "reuse" {
+			t.Fatalf("brain not routed back with reuse: %+v", brainSubs)
+		}
+	}
+}
 
-	t.Logf("created brain goal %s", goalID)
-
-	// Wait for the goal to complete or fail.
-	g := env.waitForGoalStatus(goalID, []string{"succeeded", "failed", "cancelled"}, 120*time.Second)
-	t.Logf("brain goal status: %v", g["status"])
+// §12.22：drain 后该 Worker 不再收到新 lease，inflight 回到 0。
+func TestE2E_Drain(t *testing.T) {
+	e := startEnv(t, envOpts{workers: 2})
+	if code, body := e.do("POST", "/workers/w1:drain", nil, nil); code != http.StatusAccepted {
+		t.Fatalf("drain: %d %s", code, body)
+	}
+	var ids []string
+	for i := 0; i < 3; i++ {
+		_, id := e.create("/tasks", map[string]any{"objective": "after drain", "members": []string{"assistant"}}, "")
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		e.waitStatus(id, 90*time.Second, "succeeded")
+		for _, ev := range eventsOf(e.events(id), "attempt.submitted") {
+			if ev.Data["workerID"] == "w1" {
+				t.Fatalf("drained worker got a lease: %+v", ev)
+			}
+		}
+	}
+	var ws workersView
+	if e.getJSON("/workers", &ws) != http.StatusOK || ws.Scheduler == nil || ws.Scheduler.Inflight["w1"] != 0 {
+		t.Fatalf("scheduler view: %+v", ws.Scheduler)
+	}
 }

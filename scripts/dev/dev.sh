@@ -1,78 +1,69 @@
 #!/usr/bin/env bash
-# dev.sh — one-click local dev: Redis + Dapr + Runtime + N fake Workers.
-# Usage: ./scripts/dev/dev.sh [num_workers]
+# dev.sh — 本地联调：Redis(docker) + Dapr sidecar + Runtime + N 个 fake Worker（plan T12）。
+# 用法：./scripts/dev/dev.sh [worker 数，默认 2]；Ctrl-C 或 ./scripts/dev/stop.sh 停止。
+# 只停止本脚本启动的进程（PID 记录在 $RUN_DIR/pids），不按名字模式 kill。
 set -euo pipefail
 
 NUM_WORKERS="${1:-2}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+RUN_DIR="${MYBOT_DEV_DIR:-$ROOT/.dev}"
 cd "$ROOT"
-
-export GOCACHE=/tmp/go-cache
-export GOMODCACHE=/tmp/go-mod-cache
-export GOPATH=/tmp/go-path
-
-WORKER_PIDS=()
+mkdir -p "$RUN_DIR/bin" "$RUN_DIR/artifacts"
+: > "$RUN_DIR/pids"
 
 cleanup() {
-    echo "==> Cleaning up..."
-    for pid in "${WORKER_PIDS[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    kill "$RUNTIME_PID" 2>/dev/null || true
-    daprd_pid=$(pgrep -f "daprd" || true)
-    if [ -n "$daprd_pid" ]; then
-        kill "$daprd_pid" 2>/dev/null || true
-    fi
-    redis_pid=$(pgrep -f "redis-server" || true)
-    if [ -n "$redis_pid" ]; then
-        kill "$redis_pid" 2>/dev/null || true
-    fi
+    echo "==> Stopping..."
+    "$ROOT/scripts/dev/stop.sh" || true
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
-echo "==> Starting Redis..."
-if ! pgrep -f "redis-server" > /dev/null; then
-    docker run -d --name mybot-redis -p 6379:6379 redis --appendonly yes
-    sleep 1
+# 后台启动并记录进程组（setsid 让子进程独立成组，stop.sh 按组停止）。
+spawn() {
+    local name="$1"; shift
+    setsid "$@" > "$RUN_DIR/$name.log" 2>&1 &
+    echo "$! $name" >> "$RUN_DIR/pids"
+}
+
+echo "==> Redis (docker: mybot-redis)"
+if ! docker ps --format '{{.Names}}' | grep -qx mybot-redis; then
+    docker run -d --rm --name mybot-redis -p 127.0.0.1:6379:6379 redis:7-alpine redis-server --appendonly yes > /dev/null
 fi
 
-echo "==> Starting Dapr..."
-if ! pgrep -f "daprd" > /dev/null; then
-    daprd --dapr-http-port 3500 --dapr-grpc-port 50001 \
-        --components-path deploy/dapr/local \
-        --config-file deploy/dapr/local/config.yaml \
-        --app-port 8080 \
-        --app-protocol http \
-        > /tmp/mybot-daprd.log 2>&1 &
-    sleep 3
-fi
+echo "==> Building"
+go build -o "$RUN_DIR/bin/mybot-runtime" ./cmd/mybot-runtime
+go build -o "$RUN_DIR/bin/mybot-worker" ./cmd/mybot-worker
 
-echo "==> Building..."
-go build -o /tmp/mybot-runtime ./cmd/mybot-runtime
-go build -o /tmp/mybot-worker ./cmd/mybot-worker
-
-echo "==> Starting Runtime..."
-/tmp/mybot-runtime --port 8080 --actor-port 8081 --dapr-port 50001 --global-max 2 &
-RUNTIME_PID=$!
+echo "==> Dapr sidecar + Runtime"
+spawn daprd dapr run --app-id mybot-runtime --app-port 8080 --app-protocol http \
+    --dapr-http-port 3500 --dapr-grpc-port 50001 \
+    --resources-path deploy/dapr/local --config deploy/dapr/local/config.yaml
+sleep 3
+spawn runtime "$RUN_DIR/bin/mybot-runtime" --port 8080 --dapr-port 50001 \
+    --roles config/roles.fake.yaml --roles-dir .
 sleep 2
 
-echo "==> Starting $NUM_WORKERS fake Workers..."
+echo "==> $NUM_WORKERS fake Workers"
 for i in $(seq 1 "$NUM_WORKERS"); do
-    /tmp/mybot-worker --addr ":9${i}01" --executor fake --account default --capacity 2 \
-        > /tmp/mybot-worker-${i}.log 2>&1 &
-    WORKER_PIDS+=("$!")
-    echo "   Worker $i → :9${i}01"
+    port=$((9100 + i))
+    spawn "worker-w$i" "$RUN_DIR/bin/mybot-worker" --addr ":$port" --worker-id "w$i" \
+        --executor fake --account default --capacity 2 \
+        --store-addr localhost:50001 --store-name statestore --pubsub-name pubsub \
+        --artifact-dir "$RUN_DIR/artifacts" \
+        --fake-script '{"delay":"2s","result":"{\"summary\":\"ok\",\"done\":true}"}'
+    echo "   w$i → :$port"
 done
 
-echo ""
-echo "======================================"
-echo "  my-bot dev environment is ready"
-echo "  API:      http://localhost:8080"
-echo "  Dapr:     http://localhost:3500"
-echo "  Workers:  :9101, :9201, ..."
-echo "  Logs:     /tmp/mybot-*.log"
-echo "======================================"
-echo ""
-echo "Press Ctrl-C to stop."
+cat <<INFO
 
+  my-bot dev environment is ready
+  API:   http://localhost:8080/v1
+  Logs:  $RUN_DIR/*.log
+
+  curl -s -X POST localhost:8080/v1/tasks -H 'Idempotency-Key: demo-1' \\
+       -d '{"objective":"hello","members":["assistant"]}'
+  curl -s localhost:8080/v1/goals?status=all
+  curl -s localhost:8080/v1/workers
+
+Press Ctrl-C to stop.
+INFO
 wait
