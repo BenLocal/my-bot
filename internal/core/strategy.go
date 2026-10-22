@@ -15,15 +15,18 @@ type Strategy interface {
 	Finalize(st StrategyState) RoundSummary
 }
 
-// StrategyState holds per-goal strategy state.
+// StrategyState holds per-goal strategy state. Strategies are rebuilt every
+// round (the workflow ContinueAsNew-s per round), so all state is derived from
+// the round number and the previous round's artifacts.
 type StrategyState struct {
 	Round     int
 	StepCount int
-	Artifacts []ArtifactRef
+	Artifacts []ArtifactRef // 上一轮产物，pipeline 传给下一个角色
 }
 
 // StepPlan describes a step to be executed in the current round.
 type StepPlan struct {
+	ID          string
 	Role        string
 	Instruction string
 	Inputs      []string
@@ -43,31 +46,41 @@ func NewStrategy(name string) Strategy {
 	}
 }
 
+// goalInstruction is the member instruction for deterministic strategies: the
+// Loop instruction when set, otherwise the Goal objective (spec §7.1).
+func goalInstruction(spec GoalSpec) string {
+	if spec.Instruction != "" {
+		return spec.Instruction
+	}
+	return spec.Objective
+}
+
+func artifactInputs(arts []ArtifactRef) []string {
+	inputs := make([]string, 0, len(arts))
+	for _, a := range arts {
+		inputs = append(inputs, a.Path)
+	}
+	return inputs
+}
+
 // -------- Single --------
 
 type SingleStrategy struct {
-	spec  GoalSpec
-	state StrategyState
+	spec GoalSpec
 }
 
 func (s *SingleStrategy) Init(spec GoalSpec) StrategyState {
 	s.spec = spec
-	s.state = StrategyState{Round: 0, StepCount: 0}
-	return s.state
+	return StrategyState{}
 }
 
 func (s *SingleStrategy) Next(st StrategyState, round int) []StepPlan {
-	// single strategy: one step per round targeting the brain or first member
+	// single strategy: one step per round targeting the first member (or the brain role)
 	role := s.spec.Brain
-	if role == "" && len(s.spec.Members) > 0 {
+	if len(s.spec.Members) > 0 {
 		role = s.spec.Members[0]
 	}
-	return []StepPlan{
-		{
-			Role:        role,
-			Instruction: "Execute the goal objective",
-		},
-	}
+	return []StepPlan{{ID: "main", Role: role, Instruction: goalInstruction(s.spec), Inputs: artifactInputs(st.Artifacts)}}
 }
 
 func (s *SingleStrategy) Absorb(st StrategyState, results []StepResult) StrategyState {
@@ -85,50 +98,41 @@ func (s *SingleStrategy) Finalize(st StrategyState) RoundSummary {
 
 // -------- Pipeline --------
 
+// PipelineStrategy runs members[round-1] in round `round`, passing the
+// previous round's artifacts as inputs.
 type PipelineStrategy struct {
-	spec  GoalSpec
-	state StrategyState
-	index int
+	spec GoalSpec
 }
 
 func (s *PipelineStrategy) Init(spec GoalSpec) StrategyState {
 	s.spec = spec
-	s.state = StrategyState{Round: 0, StepCount: 0}
-	s.index = 0
-	return s.state
+	return StrategyState{}
 }
 
 func (s *PipelineStrategy) Next(st StrategyState, round int) []StepPlan {
-	if s.index >= len(s.spec.Members) {
+	idx := round - 1
+	if idx < 0 || idx >= len(s.spec.Members) {
 		return []StepPlan{}
 	}
-	role := s.spec.Members[s.index]
-	instruction := fmt.Sprintf("Pipeline step %d: %s", s.index, "Execute this step")
-	// Pass previous artifacts as inputs
-	inputs := make([]string, 0)
-	for _, a := range st.Artifacts {
-		inputs = append(inputs, "mybot-artifact://"+a.Path)
-	}
-	return []StepPlan{
-		{
-			Role:        role,
-			Instruction: instruction,
-			Inputs:      inputs,
-		},
-	}
+	return []StepPlan{{
+		ID:          fmt.Sprintf("stage%d", idx+1),
+		Role:        s.spec.Members[idx],
+		Instruction: goalInstruction(s.spec),
+		Inputs:      artifactInputs(st.Artifacts),
+	}}
 }
 
 func (s *PipelineStrategy) Absorb(st StrategyState, results []StepResult) StrategyState {
 	st.StepCount++
+	st.Round++
 	for _, r := range results {
 		st.Artifacts = append(st.Artifacts, r.Artifacts...)
 	}
-	s.index++
 	return st
 }
 
 func (s *PipelineStrategy) ShouldContinue(st StrategyState) bool {
-	return s.index < len(s.spec.Members)
+	return st.Round < len(s.spec.Members)
 }
 
 func (s *PipelineStrategy) Finalize(st StrategyState) RoundSummary {
@@ -137,34 +141,23 @@ func (s *PipelineStrategy) Finalize(st StrategyState) RoundSummary {
 
 // -------- Round Robin --------
 
+// RoundRobinStrategy sorts members and picks members[(round-1)%n] (spec §5.0).
 type RoundRobinStrategy struct {
-	spec   GoalSpec
-	state  StrategyState
-	cursor int
+	spec GoalSpec
 }
 
 func (s *RoundRobinStrategy) Init(spec GoalSpec) StrategyState {
 	s.spec = spec
-	members := SortMembers(spec.Members)
-	s.spec.Members = members
-	s.state = StrategyState{Round: 0, StepCount: 0}
-	s.cursor = 0
-	return s.state
+	s.spec.Members = SortMembers(append([]string(nil), spec.Members...))
+	return StrategyState{}
 }
 
 func (s *RoundRobinStrategy) Next(st StrategyState, round int) []StepPlan {
-	if len(s.spec.Members) == 0 {
+	if len(s.spec.Members) == 0 || round < 1 {
 		return []StepPlan{}
 	}
-	idx := s.cursor % len(s.spec.Members)
-	role := s.spec.Members[idx]
-	s.cursor++
-	return []StepPlan{
-		{
-			Role:        role,
-			Instruction: fmt.Sprintf("Round %d: Execute for %s", round, role),
-		},
-	}
+	role := s.spec.Members[(round-1)%len(s.spec.Members)]
+	return []StepPlan{{ID: "main", Role: role, Instruction: goalInstruction(s.spec), Inputs: artifactInputs(st.Artifacts)}}
 }
 
 func (s *RoundRobinStrategy) Absorb(st StrategyState, results []StepResult) StrategyState {
@@ -178,6 +171,24 @@ func (s *RoundRobinStrategy) ShouldContinue(st StrategyState) bool {
 
 func (s *RoundRobinStrategy) Finalize(st StrategyState) RoundSummary {
 	return RoundSummary{Round: st.Round, Status: RoundSucceeded, Summary: "round_robin strategy complete"}
+}
+
+// DeterministicDone reports whether a deterministic-strategy goal is complete
+// after `round`: the round must have succeeded, and either a member reported
+// done=true or (pipeline) the last stage has run (spec §7.4).
+func DeterministicDone(spec GoalSpec, round int, steps []StepResult) bool {
+	if AggregateRound(steps) != RoundSucceeded {
+		return false
+	}
+	if spec.Strategy == "pipeline" && round >= len(spec.Members) {
+		return true
+	}
+	for _, s := range steps {
+		if s.Done {
+			return true
+		}
+	}
+	return false
 }
 
 // SortMembers sorts member names for deterministic ordering.

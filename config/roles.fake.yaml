@@ -1,0 +1,14 @@
+# 本地开发 / e2e 用：所有角色都绑定 fake 执行器（M0，spec §11）。
+roles:
+  planner:   { executor: fake, account: default, instructions: roles/planner.md,   timeout: 15m, capabilities: [brain] }
+  assistant: { executor: fake, account: default, instructions: roles/assistant.md, timeout: 30m }
+  designer:  { executor: fake, account: default, instructions: roles/designer.md,  timeout: 30m }
+  coder:     { executor: fake, account: default, instructions: roles/coder.md,     timeout: 60m }
+  reviewer:  { executor: fake, account: default, instructions: roles/reviewer.md,  timeout: 30m }
+  fake:      { executor: fake, account: default, instructions: roles/fake.md,      timeout: 10m }
+defaultBrain: planner
+limits:
+  globalConcurrency: 2
+  goal: { maxParallel: 2, maxStepsPerRound: 4 }
+  accounts:
+    fake/default: { concurrency: 4 }

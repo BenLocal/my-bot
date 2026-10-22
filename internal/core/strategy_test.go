@@ -2,6 +2,7 @@ package core
 
 import (
 	"testing"
+	"time"
 )
 
 func TestSingleStrategy(t *testing.T) {
@@ -128,21 +129,69 @@ func TestCheckNoProgress(t *testing.T) {
 }
 
 func TestCheckStopConditions(t *testing.T) {
-	spec := GoalSpec{Limits: Limits{MaxRounds: 3}}
-	stop, reason := CheckStopConditions(spec, 3, 0, 0, "", 0, "", 0, 0)
-	if !stop || reason != StopMaxRounds {
-		t.Errorf("expected max_rounds stop, got stop=%v reason=%s", stop, reason)
+	now := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+	tests := []struct {
+		name       string
+		spec       GoalSpec
+		round      int
+		failStreak int
+		noProgress int
+		tokens     int64
+		want       StopReason
+	}{
+		{"max rounds", GoalSpec{Limits: Limits{MaxRounds: 3}}, 3, 0, 0, 0, StopMaxRounds},
+		{"deadline", GoalSpec{Limits: Limits{Deadline: &past}}, 1, 0, 0, 0, StopDeadline},
+		{"budget", GoalSpec{Limits: Limits{MaxTokens: 100}}, 1, 0, 0, 100, StopBudget},
+		{"fail streak custom", GoalSpec{Limits: Limits{FailStreak: 2}}, 1, 2, 0, 0, StopFailStreak},
+		{"fail streak default", GoalSpec{}, 1, 3, 0, 0, StopFailStreak},
+		{"no progress default", GoalSpec{}, 1, 0, 3, 0, StopNoProgress},
+		{"continue", GoalSpec{Limits: Limits{MaxRounds: 5}}, 2, 2, 2, 0, ""},
 	}
-
-	spec2 := GoalSpec{Limits: Limits{FailStreak: 2}}
-	stop, reason = CheckStopConditions(spec2, 1, 2, 0, "", 0, "", 0, 0)
-	if !stop || reason != StopFailStreak {
-		t.Errorf("expected fail_streak stop, got stop=%v reason=%s", stop, reason)
+	for _, tt := range tests {
+		stop, reason := CheckStopConditions(tt.spec, now, tt.round, tt.failStreak, tt.noProgress, tt.tokens)
+		if reason != tt.want || stop != (tt.want != "") {
+			t.Errorf("%s: got stop=%v reason=%q, want %q", tt.name, stop, reason, tt.want)
+		}
 	}
+}
 
-	spec3 := GoalSpec{Limits: Limits{NoProgress: 3}}
-	stop, reason = CheckStopConditions(spec3, 1, 0, 3, "", 0, "", 0, 0)
-	if !stop || reason != StopNoProgress {
-		t.Errorf("expected no_progress stop, got stop=%v reason=%s", stop, reason)
+func TestDeterministicDone(t *testing.T) {
+	ok := []StepResult{{Status: StepSucceeded}}
+	done := []StepResult{{Status: StepSucceeded, Done: true}}
+	failed := []StepResult{{Status: StepFailed, Done: true}}
+	pipe := GoalSpec{Strategy: "pipeline", Members: []string{"a", "b"}}
+	if DeterministicDone(pipe, 1, ok) || !DeterministicDone(pipe, 2, ok) {
+		t.Error("pipeline should finish after the last stage")
+	}
+	single := GoalSpec{Strategy: "single"}
+	if DeterministicDone(single, 1, ok) || !DeterministicDone(single, 1, done) || DeterministicDone(single, 1, failed) {
+		t.Error("single finishes only on a succeeded round with done=true")
+	}
+}
+
+func TestParseRolesConfig(t *testing.T) {
+	cfg, err := ParseRolesConfig([]byte(`
+roles:
+  planner: { executor: fake, account: default, instructions: roles/planner.md, timeout: 15m, capabilities: [brain] }
+  coder:   { executor: fake, account: default, timeout: 1h }
+defaultBrain: planner
+limits:
+  globalConcurrency: 2
+  goal: { maxParallel: 2, maxStepsPerRound: 4 }
+  accounts:
+    fake/default: { concurrency: 3 }
+`))
+	if err != nil {
+		t.Fatalf("ParseRolesConfig: %v", err)
+	}
+	if !cfg.Roles["planner"].HasCapability("brain") || cfg.Limits.GlobalConcurrency != 2 || cfg.AccountLimits()["fake/default"] != 3 {
+		t.Errorf("unexpected config %+v", cfg)
+	}
+	if _, err := ParseRolesConfig([]byte("roles:\n  a: { executor: fake }\n")); err == nil {
+		t.Error("expected error for missing account")
+	}
+	if _, err := ParseRolesConfig([]byte("roles:\n  a: { executor: fake, account: x }\ndefaultBrain: b\n")); err == nil {
+		t.Error("expected error for unknown defaultBrain")
 	}
 }

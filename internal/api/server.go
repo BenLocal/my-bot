@@ -3,14 +3,18 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync/atomic"
 
 	"github.com/dapr/durabletask-go/workflow"
 	daprclient "github.com/dapr/go-sdk/client"
 
+	"github.com/BenLocal/my-bot/internal/core"
 	"github.com/BenLocal/my-bot/internal/store"
 )
 
@@ -24,6 +28,22 @@ type Server struct {
 	token    atomic.Value // string
 	wfClient *workflow.Client
 	daprCl   daprclient.Client
+	roles    core.RolesConfig
+	rolesDir string // 指令文件路径的根目录
+
+	artifactDir string // 共享卷产物根目录（只读挂载）
+}
+
+// SetArtifactDir sets the shared-volume artifact root used by artifact downloads.
+func (s *Server) SetArtifactDir(dir string) {
+	s.artifactDir = dir
+}
+
+// SetRoles sets the roles.yaml config used to freeze goal specs; rolesDir is
+// the base directory that instruction paths are relative to.
+func (s *Server) SetRoles(cfg core.RolesConfig, rolesDir string) {
+	s.roles = cfg
+	s.rolesDir = rolesDir
 }
 
 // NewServer creates an API server. A nil logger falls back to slog.Default.
@@ -55,27 +75,84 @@ func (s *Server) tokenValue() string {
 	return v
 }
 
-// Handler returns the fully wired route handler. The health check is public;
-// every other route is wrapped by the bearer-token middleware.
+// Handler returns the fully wired route handler. Health probes are public;
+// every other route is wrapped by the bearer-token middleware. Routes are
+// served both under /v1 (spec §8) and at the root (back-compat).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleHealth)
 
-	mux.Handle("POST /goals", s.requireAuth(http.HandlerFunc(s.handleCreateGoal)))
-	mux.Handle("GET /goals", s.requireAuth(http.HandlerFunc(s.handleListGoals)))
-	mux.Handle("GET /goals/{id}", s.requireAuth(http.HandlerFunc(s.handleGetGoal)))
-	mux.Handle("GET /goals/{id}/events", s.requireAuth(http.HandlerFunc(s.handleGetEvents)))
-	mux.Handle("GET /goals/{id}/events/stream", s.requireAuth(http.HandlerFunc(s.handleEventStream)))
-	mux.Handle("POST /goals/{id}/pause", s.requireAuth(http.HandlerFunc(s.handlePauseGoal)))
-	mux.Handle("POST /goals/{id}/resume", s.requireAuth(http.HandlerFunc(s.handleResumeGoal)))
-	mux.Handle("POST /goals/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelGoal)))
-	mux.Handle("POST /goals/{id}/append", s.requireAuth(http.HandlerFunc(s.handleAppendGoal)))
+	auth := func(h http.HandlerFunc) http.Handler { return s.requireAuth(h) }
+	mux.Handle("POST /goals", auth(s.handleCreateGoal))
+	mux.Handle("POST /tasks", auth(s.handleCreateTask))
+	mux.Handle("GET /goals", auth(s.handleListGoals))
+	mux.Handle("GET /goals/{id}", auth(s.handleGetGoal))
+	mux.Handle("GET /goals/{id}/events", auth(s.handleGetEvents))
+	mux.Handle("GET /goals/{id}/events/stream", auth(s.handleEventStream))
+	// spec 形式 POST /goals/{id}:pause；ServeMux 通配符必须是整段，后缀在 handleGoalAction 里解析。
+	mux.Handle("POST /goals/{idAction}", auth(s.handleGoalAction))
+	mux.Handle("POST /goals/{id}/pause", auth(s.handlePauseGoal))
+	mux.Handle("POST /goals/{id}/resume", auth(s.handleResumeGoal))
+	mux.Handle("POST /goals/{id}/cancel", auth(s.handleCancelGoal))
+	mux.Handle("POST /goals/{id}/append", auth(s.handleAppendGoal))
 
-	mux.Handle("GET /workers", s.requireAuth(http.HandlerFunc(s.handleListWorkers)))
-	mux.Handle("POST /workers/{executor}/{id}", s.requireAuth(http.HandlerFunc(s.handleWorkerAction)))
+	mux.Handle("GET /goals/{id}/rounds", auth(s.handleListRounds))
+	mux.Handle("GET /goals/{id}/rounds/{n}", auth(s.handleRoundDetail))
+	mux.Handle("GET /goals/{id}/artifacts/{round}/{stepID}/{name}", auth(s.handleArtifactDownload))
 
-	return mux
+	mux.Handle("GET /workers", auth(s.handleListWorkers))
+	mux.Handle("POST /workers/{id}", auth(s.handleWorkerAction))
+	mux.Handle("POST /workers/{executor}/{id}", auth(s.handleWorkerAction))
+	mux.Handle("POST /accounts/{executor}/{account}", auth(s.handleAccountAction))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = strings.TrimPrefix(r.URL.Path, "/v1")
+			r2.URL.RawPath = ""
+			mux.ServeHTTP(w, r2)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// handleGoalAction dispatches POST /goals/{id}:pause|:resume|:cancel|:append.
+func (s *Server) handleGoalAction(w http.ResponseWriter, r *http.Request) {
+	raw := r.PathValue("idAction")
+	id, action, ok := strings.Cut(raw, ":")
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown goal action")
+		return
+	}
+	r.SetPathValue("id", id)
+	switch action {
+	case "pause":
+		s.handlePauseGoal(w, r)
+	case "resume":
+		s.handleResumeGoal(w, r)
+	case "cancel":
+		s.handleCancelGoal(w, r)
+	case "append":
+		s.handleAppendGoal(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "unknown goal action")
+	}
+}
+
+// handleCreateTask is POST /tasks: a goal with kind=task.
+func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	var raw map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	raw["kind"] = string(core.KindTask)
+	r.Body = io.NopCloser(bytes.NewReader(mustJSON(raw)))
+	s.handleCreateGoal(w, r)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

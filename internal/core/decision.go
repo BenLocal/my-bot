@@ -20,37 +20,35 @@ func DecisionSchema() map[string]interface{} {
 				"enum":        []string{"dispatch", "finish", "ask_user"},
 				"description": "What the brain wants to do this round",
 			},
+			"summary": map[string]interface{}{
+				"type":        "string",
+				"description": "Progress summary of the goal so far (used as the next round's [progress])",
+			},
 			"steps": map[string]interface{}{
 				"type":        "array",
-				"description": "Steps to dispatch to members (only for action=dispatch)",
+				"description": "Steps to dispatch to members in parallel (only for action=dispatch)",
 				"items": map[string]interface{}{
 					"type":     "object",
-					"required": []string{"role", "instruction"},
+					"required": []string{"id", "role", "instruction"},
 					"properties": map[string]interface{}{
+						"id":          map[string]interface{}{"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
 						"role":        map[string]interface{}{"type": "string"},
 						"instruction": map[string]interface{}{"type": "string"},
 						"inputs": map[string]interface{}{
 							"type":  "array",
 							"items": map[string]interface{}{"type": "string"},
 						},
+						"workspace": map[string]interface{}{"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
 					},
 				},
 			},
 			"done": map[string]interface{}{
 				"type":        "boolean",
-				"description": "Whether the goal is complete (only for action=finish)",
+				"description": "Whether the goal is complete (required true for action=finish)",
 			},
-			"reason": map[string]interface{}{
+			"question": map[string]interface{}{
 				"type":        "string",
-				"description": "Reason for finishing or asking",
-			},
-			"askUser": map[string]interface{}{
-				"type":        "object",
-				"description": "User question (only for action=ask_user)",
-				"properties": map[string]interface{}{
-					"question": map[string]interface{}{"type": "string"},
-				},
-				"required": []string{"question"},
+				"description": "Question for the user (only for action=ask_user)",
 			},
 			"memories": map[string]interface{}{
 				"type":        "array",
@@ -160,74 +158,80 @@ func (v Violation) String() string {
 	return fmt.Sprintf("[%s] %s: %s", v.Rule, v.Field, v.Message)
 }
 
-// ValidateDecision checks a Decision against spec §5.3 rules.
-// ctx provides context for validation (member roles, artifact references, limits).
+// DefaultMaxStepsPerRound is the default per-round step limit (spec §5.3 rule 2).
+const DefaultMaxStepsPerRound = 4
+
+// ValidationContext provides context for validation (member roles, artifact references, limits).
 type ValidationContext struct {
 	MemberRoles       []string
-	ExistingArtifacts []string
+	ExistingArtifacts []string // 已登记产物引用 r<round>/<stepID>/<name>
+	InputMounts       []string // Goal 声明的输入挂载名
+	Workspaces        []string // Goal 声明的工作区名
 	MaxStepsPerRound  int
 	MaxTokens         int64
 }
 
+var idRe = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
+
+// ValidateDecision checks a Decision against spec §5.3 rules. Rule labels:
+// R0 action/字段形状；R1 成员角色；R2 数量与 id；R3 inputs 与 workspace；R6 finish 需 done。
 func ValidateDecision(d Decision, ctx ValidationContext) []Violation {
 	var violations []Violation
 
-	// Rule 1: action must be one of dispatch, finish, ask_user
 	switch d.Action {
-	case "dispatch":
-	case "finish":
+	case "dispatch", "finish":
 	case "ask_user":
+		if strings.TrimSpace(d.Question) == "" {
+			violations = append(violations, Violation{"R0", "question", "ask_user requires a non-empty question"})
+		}
 	case "":
-		violations = append(violations, Violation{"R1", "action", "action is required and must be dispatch, finish, or ask_user"})
+		violations = append(violations, Violation{"R0", "action", "action is required and must be dispatch, finish, or ask_user"})
 	default:
-		violations = append(violations, Violation{"R1", "action", fmt.Sprintf("unknown action %q", d.Action)})
+		violations = append(violations, Violation{"R0", "action", fmt.Sprintf("unknown action %q", d.Action)})
 	}
 
-	// Rule 2: for dispatch, steps must be non-empty
-	if d.Action == "dispatch" && len(d.Steps) == 0 {
-		violations = append(violations, Violation{"R2", "steps", "dispatch action requires at least one step"})
-	}
-
-	// Rule 3: dispatch step roles must be in member roles
-	for i, step := range d.Steps {
-		role := step.Role
-		found := false
-		for _, m := range ctx.MemberRoles {
-			if m == role {
-				found = true
-				break
-			}
+	if d.Action == "dispatch" {
+		maxSteps := ctx.MaxStepsPerRound
+		if maxSteps <= 0 {
+			maxSteps = DefaultMaxStepsPerRound
 		}
-		if !found {
-			violations = append(violations, Violation{"R3", fmt.Sprintf("steps[%d].role", i),
-				fmt.Sprintf("role %q is not a member role", role)})
+		if len(d.Steps) == 0 {
+			violations = append(violations, Violation{"R2", "steps", "dispatch action requires at least one step"})
 		}
+		if len(d.Steps) > maxSteps {
+			violations = append(violations, Violation{"R2", "steps",
+				fmt.Sprintf("too many steps: %d > maxStepsPerRound %d", len(d.Steps), maxSteps)})
+		}
+	} else if len(d.Steps) > 0 {
+		violations = append(violations, Violation{"R0", "steps", fmt.Sprintf("steps are only allowed for action=dispatch, got action %q", d.Action)})
 	}
 
-	// Rule 4: for dispatch, step count must not exceed maxStepsPerRound
-	if d.Action == "dispatch" && ctx.MaxStepsPerRound > 0 && len(d.Steps) > ctx.MaxStepsPerRound {
-		violations = append(violations, Violation{"R4", "steps",
-			fmt.Sprintf("too many steps: %d > max %d", len(d.Steps), ctx.MaxStepsPerRound)})
-	}
-
-	// Rule 5: for dispatch, input artifact references must exist
+	seen := map[string]bool{}
 	for i, step := range d.Steps {
+		if !contains(ctx.MemberRoles, step.Role) {
+			violations = append(violations, Violation{"R1", fmt.Sprintf("steps[%d].role", i),
+				fmt.Sprintf("role %q is not a member of this goal (members: %s)", step.Role, strings.Join(ctx.MemberRoles, ", "))})
+		}
+		if !idRe.MatchString(step.ID) {
+			violations = append(violations, Violation{"R2", fmt.Sprintf("steps[%d].id", i),
+				fmt.Sprintf("id %q must match [a-z0-9-]{1,32}", step.ID)})
+		} else if seen[step.ID] {
+			violations = append(violations, Violation{"R2", fmt.Sprintf("steps[%d].id", i),
+				fmt.Sprintf("id %q is not unique in this round", step.ID)})
+		}
+		seen[step.ID] = true
 		for j, input := range step.Inputs {
-			found := false
-			for _, a := range ctx.ExistingArtifacts {
-				if a == input {
-					found = true
-					break
-				}
+			if !contains(ctx.ExistingArtifacts, input) && !contains(ctx.InputMounts, input) {
+				violations = append(violations, Violation{"R3", fmt.Sprintf("steps[%d].inputs[%d]", i, j),
+					fmt.Sprintf("artifact %q not found (expected a registered r<round>/<stepID>/<name> or a declared input mount)", input)})
 			}
-			if !found {
-				violations = append(violations, Violation{"R5", fmt.Sprintf("steps[%d].inputs[%d]", i, j),
-					fmt.Sprintf("artifact %q not found", input)})
-			}
+		}
+		if step.Workspace != "" && !contains(ctx.Workspaces, step.Workspace) && !idRe.MatchString(step.Workspace) {
+			violations = append(violations, Violation{"R3", fmt.Sprintf("steps[%d].workspace", i),
+				fmt.Sprintf("workspace %q is neither declared nor a valid new name [a-z0-9-]{1,32}", step.Workspace)})
 		}
 	}
 
-	// Rule 6: for finish, done must be true
 	if d.Action == "finish" && !d.Done {
 		violations = append(violations, Violation{"R6", "done", "finish action requires done=true"})
 	}
@@ -246,10 +250,6 @@ func ValidateDecision(d Decision, ctx ValidationContext) []Violation {
 			violations = append(violations, Violation{"RM3", fmt.Sprintf("memories[%d].kind", i),
 				fmt.Sprintf("kind %q must be fact, pitfall, or preference", m.Kind)})
 		}
-	}
-
-	// Credential scan on memory text
-	for i, m := range d.Memories {
 		if containsCredential(m.Text) {
 			violations = append(violations, Violation{"RM4", fmt.Sprintf("memories[%d].text", i),
 				"memory text contains credential-like patterns"})
@@ -257,6 +257,40 @@ func ValidateDecision(d Decision, ctx ValidationContext) []Violation {
 	}
 
 	return violations
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// OutputContract is the member step output contract (spec §7.1).
+type OutputContract struct {
+	Summary   string   `json:"summary"`
+	Done      bool     `json:"done"`
+	Artifacts []string `json:"artifacts,omitempty"`
+}
+
+// ParseOutputContract extracts the member output contract JSON from raw output,
+// using the same deterministic patching as ParseDecision. Unknown fields are
+// tolerated; a missing summary is an error (spec §7.4 rule 1).
+func ParseOutputContract(raw string) (OutputContract, error) {
+	text := extractJSON(raw)
+	if text == "" {
+		return OutputContract{}, fmt.Errorf("no output contract JSON found")
+	}
+	var oc OutputContract
+	if err := json.Unmarshal([]byte(text), &oc); err != nil {
+		return OutputContract{}, fmt.Errorf("output contract JSON decode: %w", err)
+	}
+	if strings.TrimSpace(oc.Summary) == "" {
+		return OutputContract{}, fmt.Errorf("output contract: summary is required")
+	}
+	return oc, nil
 }
 
 var topicRe = regexp.MustCompile(`^[a-z0-9-]{1,48}$`)

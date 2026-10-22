@@ -6,9 +6,11 @@ require (
 	github.com/a2aproject/a2a-go/v2 v2.6.0
 	github.com/dapr/durabletask-go v0.12.6
 	github.com/dapr/go-sdk v1.15.0
+	github.com/go-chi/chi/v5 v5.2.2
 	github.com/google/uuid v1.6.0
 	github.com/oklog/ulid/v2 v2.1.2
 	google.golang.org/grpc v1.83.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -16,7 +18,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dapr/dapr v1.18.0 // indirect
 	github.com/dapr/kit v0.18.1 // indirect
-	github.com/go-chi/chi/v5 v5.2.2 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -32,5 +33,4 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

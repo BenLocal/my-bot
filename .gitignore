@@ -39,5 +39,9 @@ dev-env.local.md
 spikes/
 
 # 编译产物
-mybot-runtime
-mybot-worker
+/mybot-runtime
+/mybot-worker
+
+# 本地联调（scripts/dev）与 Redis 落盘文件
+.dev/
+dump.rdb

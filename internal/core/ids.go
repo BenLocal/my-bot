@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -17,17 +16,14 @@ func NewGoalID() string {
 	return "g_" + id
 }
 
-// AttemptKey derives a deterministic attempt key from goal, round, step, attempt.
+// AttemptKey derives the deterministic attempt key <goalID>-r<round>-<stepID>-a<attempt> (spec §5.2 step 5).
 func AttemptKey(goalID string, round int, stepID string, attempt int) string {
-	h := fnv.New32a()
-	h.Write([]byte(goalID))
-	hash := hex.EncodeToString(h.Sum(nil))
-	return fmt.Sprintf("r%d:s%s:a%d:%s", round, stepID, attempt, hash[:8])
+	return fmt.Sprintf("%s-r%d-%s-a%d", goalID, round, stepID, attempt)
 }
 
-// AskRequestID derives a deterministic request ID for ask_user.
-func AskRequestID(goalID string, round int) string {
-	return fmt.Sprintf("ask_%s_r%d", goalID, round)
+// AskRequestID derives the deterministic ask_user request ID ask:<goalID>:r<round>:<n> (spec §5.3).
+func AskRequestID(goalID string, round, n int) string {
+	return fmt.Sprintf("ask:%s:r%d:%d", goalID, round, n)
 }
 
 // EventID derives a deterministic event ID: <goalID>:<seq>

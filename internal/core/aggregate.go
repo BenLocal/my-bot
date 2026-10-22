@@ -44,29 +44,37 @@ const (
 
 func (r StopReason) String() string { return string(r) }
 
+// Default stop thresholds (spec §5.2 step 2).
+const (
+	DefaultFailStreak = 3
+	DefaultNoProgress = 3
+)
+
 // CheckStopConditions checks all stop conditions and returns the first triggered.
-// Parameters: spec, current round, fail streak count, no-progress count,
-// previous summary, previous artifact count, current summary, current artifact count.
-func CheckStopConditions(
-	spec GoalSpec,
-	round, failStreak, noProgress int,
-	prevSummary string, prevArtifacts int,
-	currSummary string, currArtifacts int,
-	tokensUsed int64,
-) (bool, StopReason) {
+// `round` is the number of completed rounds; `now` must come from the workflow
+// clock (ctx.CurrentTimeUTC) so the check is replay-safe.
+func CheckStopConditions(spec GoalSpec, now time.Time, round, failStreak, noProgress int, tokensUsed int64) (bool, StopReason) {
 	if spec.Limits.MaxRounds > 0 && round >= spec.Limits.MaxRounds {
 		return true, StopMaxRounds
 	}
-	if spec.Limits.Deadline != nil && time.Now().After(*spec.Limits.Deadline) {
+	if spec.Limits.Deadline != nil && now.After(*spec.Limits.Deadline) {
 		return true, StopDeadline
 	}
 	if spec.Limits.MaxTokens > 0 && tokensUsed >= spec.Limits.MaxTokens {
 		return true, StopBudget
 	}
-	if spec.Limits.FailStreak > 0 && failStreak >= spec.Limits.FailStreak {
+	maxFail := spec.Limits.FailStreak
+	if maxFail <= 0 {
+		maxFail = DefaultFailStreak
+	}
+	if failStreak >= maxFail {
 		return true, StopFailStreak
 	}
-	if spec.Limits.NoProgress > 0 && noProgress >= spec.Limits.NoProgress {
+	maxNoProgress := spec.Limits.NoProgress
+	if maxNoProgress <= 0 {
+		maxNoProgress = DefaultNoProgress
+	}
+	if noProgress >= maxNoProgress {
 		return true, StopNoProgress
 	}
 	return false, ""

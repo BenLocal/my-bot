@@ -1,6 +1,9 @@
 package orchestrator
 
 import (
+	"context"
+	"log/slog"
+
 	"github.com/dapr/durabletask-go/workflow"
 )
 
@@ -19,20 +22,21 @@ func NewRegistry() *workflow.Registry {
 		name string
 		fn   workflow.Activity
 	}{
-		{"SubmitAttempt", wrapSubmitAttempt},
-		{"PollAttempt", wrapPollAttempt},
-		{"AcquireSlot", wrapAcquireSlot},
-		{"ReleaseSlot", wrapReleaseSlot},
-		{"CollectStep", wrapCollectStep},
-		{"CollectRound", wrapCollectRound},
-		{"ScheduleWorkflow", wrapScheduleWorkflow},
-		{"FinishGoal", wrapFinishGoal},
-		{"RunCheck", wrapRunCheck},
-		{"CommitMemories", wrapCommitMemories},
-		{"RecallMemory", wrapRecallMemory},
+		{ActSubmitAttempt, activity(SubmitAttempt)},
+		{ActPollAttempt, activity(PollAttempt)},
+		{ActCancelAttempt, activityNoResult(CancelAttempt)},
+		{ActAcquireSlot, activity(AcquireSlot)},
+		{ActReleaseSlot, activityNoResult(ReleaseSlot)},
+		{ActReleaseWaiter, activityNoResult(ReleaseWaiter)},
+		{ActAccountState, activityNoResult(AccountState)},
+		{ActCollectStep, activityNoResult(CollectStep)},
+		{ActProject, activityNoResult(Project)},
+		{ActFinishGoal, activityNoResult(FinishGoal)},
+		{ActSaveRoundSummary, activityNoResult(SaveRoundSummary)},
+		{ActRunCheck, activity(RunCheck)},
 	}
 	for _, a := range activities {
-		if err := r.AddActivityN(a.name, a.fn); err != nil {
+		if err := r.AddActivityN(a.name, logged(a.name, a.fn)); err != nil {
 			panic("orchestrator: failed to register activity " + a.name + ": " + err.Error())
 		}
 	}
@@ -40,92 +44,35 @@ func NewRegistry() *workflow.Registry {
 	return r
 }
 
-// ---- Activity wrappers ----
-
-func wrapSubmitAttempt(ctx workflow.ActivityContext) (any, error) {
-	var req SubmitAttemptReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
+// logged logs activity errors (they are otherwise only visible in workflow history).
+func logged(name string, fn workflow.Activity) workflow.Activity {
+	return func(ctx workflow.ActivityContext) (any, error) {
+		out, err := fn(ctx)
+		if err != nil {
+			slog.Warn("activity failed", "activity", name, "error", err)
+		}
+		return out, err
 	}
-	return SubmitAttempt(ctx.Context(), req)
 }
 
-func wrapPollAttempt(ctx workflow.ActivityContext) (any, error) {
-	var req PollAttemptReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
+// activity adapts a typed activity function to workflow.Activity.
+func activity[Req, Resp any](fn func(context.Context, Req) (Resp, error)) workflow.Activity {
+	return func(ctx workflow.ActivityContext) (any, error) {
+		var req Req
+		if err := ctx.GetInput(&req); err != nil {
+			return nil, err
+		}
+		return fn(ctx.Context(), req)
 	}
-	return PollAttempt(ctx.Context(), req)
 }
 
-func wrapAcquireSlot(ctx workflow.ActivityContext) (any, error) {
-	var req AcquireSlotReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
+// activityNoResult adapts a typed activity function without a result.
+func activityNoResult[Req any](fn func(context.Context, Req) error) workflow.Activity {
+	return func(ctx workflow.ActivityContext) (any, error) {
+		var req Req
+		if err := ctx.GetInput(&req); err != nil {
+			return nil, err
+		}
+		return nil, fn(ctx.Context(), req)
 	}
-	return AcquireSlot(ctx.Context(), req)
-}
-
-func wrapReleaseSlot(ctx workflow.ActivityContext) (any, error) {
-	var req ReleaseSlotReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return nil, ReleaseSlot(ctx.Context(), req)
-}
-
-func wrapCollectStep(ctx workflow.ActivityContext) (any, error) {
-	var req CollectStepReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return CollectStep(ctx.Context(), req)
-}
-
-func wrapCollectRound(ctx workflow.ActivityContext) (any, error) {
-	var req CollectRoundReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return CollectRound(ctx.Context(), req)
-}
-
-func wrapScheduleWorkflow(ctx workflow.ActivityContext) (any, error) {
-	var req ScheduleWorkflowReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return nil, ScheduleWorkflow(ctx.Context(), req)
-}
-
-func wrapFinishGoal(ctx workflow.ActivityContext) (any, error) {
-	var req FinishGoalReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return nil, FinishGoal(ctx.Context(), req)
-}
-
-func wrapRunCheck(ctx workflow.ActivityContext) (any, error) {
-	var req RunCheckReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return RunCheck(ctx.Context(), req)
-}
-
-func wrapCommitMemories(ctx workflow.ActivityContext) (any, error) {
-	var req CommitMemoriesReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return nil, CommitMemories(ctx.Context(), req)
-}
-
-func wrapRecallMemory(ctx workflow.ActivityContext) (any, error) {
-	var req RecallMemoryReq
-	if err := ctx.GetInput(&req); err != nil {
-		return nil, err
-	}
-	return RecallMemory(ctx.Context(), req)
 }

@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,386 +12,408 @@ import (
 	"github.com/BenLocal/my-bot/internal/core"
 )
 
-// WorkflowState is the persisted state passed between rounds via ContinueAsNew.
+// WorkflowState is the GoalState of spec §5.2: the input carried between
+// rounds via ContinueAsNew. Round is the number of completed rounds.
 type WorkflowState struct {
-	GoalID        string
-	Spec          core.GoalSpec
-	Round         int
-	Progress      string
-	Budget        core.Budget
-	FailStreak    int
-	NoProgress    int
-	PrevSummary   string
-	PrevArtifacts int
-	CurrArtifacts int
-	LastResults   []core.StepResult
-	Decision      *core.Decision
-	ScheduledAt   *time.Time
-
-	// ValidationFailCount tracks consecutive brain decision validation failures.
-	// Per spec §5.3, the brain gets 2 retries before counting as FailStreak.
-	ValidationFailCount int
+	GoalID       string
+	Spec         core.GoalSpec
+	Round        int
+	Progress     string
+	Budget       core.Budget
+	FailStreak   int
+	NoProgress   int
+	LastResults  []core.StepResult // 上一轮成员结果，供大脑下一轮输入
+	Artifacts    []string          // 本 Goal 已登记产物引用 r<round>/<stepID>/<name>
+	Paused       bool
+	PendingNotes []string          // 追加指令 / ask_user 回答，下一轮生效
+	LastWorker   map[string]string // role → workerID，会话亲和（§5.1）
+	EventSeq     int               // 已分配的事件序号；事件 ID = <goalID>:<seq>
 
 	// PendingSignals is the inbox of signals received but not yet consumed.
-	// Using a slice (not map) for deterministic workflow replay.
+	// A slice (not a map) keeps replay deterministic.
 	PendingSignals []*Signal
 }
 
-// Signal kinds for the inbox pattern.
-const (
-	SignalAttemptDone = "attempt-done"
-	SignalSlotGranted = "slot-granted"
-	SignalControl     = "control"
-	SignalUserInput   = "user-input"
-)
-
-// Signal is the envelope for all external events.
-type Signal struct {
-	Kind string
-	Key  string
-	Data json.RawMessage
+// run holds the per-execution (runtime-only) state of one workflow round.
+type run struct {
+	ctx       *workflow.WorkflowContext
+	st        *WorkflowState
+	events    []core.Event // 已分配序号、尚未落库的事件
+	cancelled bool
+	resumed   bool
 }
 
-// ControlSignal carries pause/resume/cancel/append/ask_user_reply.
-type ControlSignal struct {
-	Action  string
-	Note    string
-	ReplyTo string
-}
+func (r *run) now() time.Time { return r.ctx.CurrentTimeUTC() }
 
-// GoalWorkflow is the Dapr durable workflow for Goal/Loop/Task execution.
+// GoalWorkflow is the Dapr durable workflow for Goal/Task execution: one
+// execution = one round, then ContinueAsNew (spec §5.2).
 func GoalWorkflow(ctx *workflow.WorkflowContext) (any, error) {
-	var state WorkflowState
-	if err := ctx.GetInput(&state); err != nil {
+	var st WorkflowState
+	if err := ctx.GetInput(&st); err != nil {
 		return nil, fmt.Errorf("workflow input: %w", err)
 	}
+	r := &run{ctx: ctx, st: &st}
 
-	for {
-		// Drain any pending signals from the inbox.
-		drainSignals(ctx, &state)
-
-		// Check for control signals.
-		ctrl := tryReadControl(ctx, &state)
-		if ctrl != nil {
-			switch ctrl.Action {
-			case "cancel":
-				finalizeGoal(ctx, &state, core.StopCancelled)
-				return nil, nil
-			case "append":
-				state.Spec.Objective += "\n[notes]\n" + ctrl.Note
-				continue
-			case "ask_user_reply":
-				state.Spec.Objective += "\n[user reply]\n" + ctrl.Note
-				continue
-			case "pause":
-				if !waitForResume(ctx, &state) {
-					finalizeGoal(ctx, &state, core.StopCancelled)
-					return nil, nil
-				}
-			case "resume":
-				// continue
-			}
-		}
-
-		state.Round++
-
-		roundSummary, stop, reason, err := executeRound(ctx, &state)
-		if err != nil {
-			return nil, err
-		}
-
-		if stop {
-			finalizeGoal(ctx, &state, reason)
-			return nil, nil
-		}
-
-		state.LastResults = roundSummary.Steps
-		state.PrevSummary = roundSummary.Summary
-		state.PrevArtifacts = state.CurrArtifacts
-
-		ctx.ContinueAsNew(state, workflow.WithKeepUnprocessedEvents())
+	// 第 1 步：读空 inbox 并处理控制事件。上一代遗留的 attempt-done / slot-granted
+	// 都属于已结束的 Step（轮次之间不持有 lease），直接丢弃。
+	r.collectSignals()
+	r.applyControls()
+	r.st.PendingSignals = nil
+	if r.cancelled {
+		return nil, r.finish(core.GoalCancelled, core.StopCancelled)
 	}
-}
-
-// executeRound runs one round of the goal.
-func executeRound(ctx *workflow.WorkflowContext, state *WorkflowState) (core.RoundSummary, bool, core.StopReason, error) {
-	// Check stop conditions.
-	stop, reason := checkStop(state)
-	if stop {
-		return core.RoundSummary{}, true, reason, nil
+	if st.Paused {
+		r.emit("goal.paused", nil)
+		r.project(core.GoalPaused, "")
+		for st.Paused && !r.cancelled {
+			r.wait(-1, nil)
+		}
+		if r.cancelled {
+			return nil, r.finish(core.GoalCancelled, core.StopCancelled)
+		}
+		r.emit("goal.resumed", nil)
 	}
 
-	var steps []core.StepResult
+	// 第 2 步：判停。
+	if stop, reason := core.CheckStopConditions(st.Spec, r.now(), st.Round, st.FailStreak, st.NoProgress, st.Budget.TokensUsed); stop {
+		return nil, r.finish(core.GoalFailed, reason)
+	}
 
-	if state.Spec.Strategy == "brain" {
-		brainResult, err := runBrainStep(ctx, state)
-		if err != nil {
-			return core.RoundSummary{}, false, "", err
-		}
-		if brainResult.Status != core.StepSucceeded {
-			state.FailStreak++
-			return core.RoundSummary{
-				Round:   state.Round,
-				Status:  core.RoundFailed,
-				Summary: "brain step failed",
-				Steps:   []core.StepResult{brainResult},
-			}, false, "", nil
-		}
+	st.Round++
+	r.emit("round.started", map[string]any{"round": st.Round})
+	r.project(core.GoalRunning, "")
 
-		state.FailStreak = 0
-
-		if brainResult.Decision == nil {
-			return core.RoundSummary{}, false, "", fmt.Errorf("no decision in brain result")
-		}
-
-		decision := brainResult.Decision
-		state.Decision = decision
-
-		// Validate the decision per spec §5.3.
-		// Build validation context from current state.
-		existingArtifacts := make([]string, 0)
-		for _, r := range state.LastResults {
-			for _, a := range r.Artifacts {
-				existingArtifacts = append(existingArtifacts, a.Path)
-			}
-		}
-		vctx := core.ValidationContext{
-			MemberRoles:       state.Spec.Members,
-			ExistingArtifacts: existingArtifacts,
-			MaxStepsPerRound:  state.Spec.Limits.MaxStepsPerRound,
-			MaxTokens:         state.Spec.Limits.MaxTokens,
-		}
-		violations := core.ValidateDecision(*decision, vctx)
-		if len(violations) > 0 {
-			state.ValidationFailCount++
-			if state.ValidationFailCount >= 2 {
-				state.FailStreak++
-				state.ValidationFailCount = 0
-			}
-			// Return violations to the brain for retry.
-			violationMsgs := make([]string, len(violations))
-			for i, v := range violations {
-				violationMsgs[i] = v.String()
-			}
-			return core.RoundSummary{
-				Round:   state.Round,
-				Status:  core.RoundFailed,
-				Summary: fmt.Sprintf("decision validation failed: %s", strings.Join(violationMsgs, "; ")),
-				Steps:   []core.StepResult{brainResult},
-			}, false, "", nil
-		}
-		state.ValidationFailCount = 0
-
-		if decision.Action == "finish" && decision.Done {
-			if state.Spec.Check != nil {
-				checkResult, err := runCheck(ctx, state)
-				if err != nil {
-					return core.RoundSummary{}, false, "", err
-				}
-				steps = append(steps, brainResult)
-				steps = append(steps, checkResult)
-				if checkResult.Status != core.StepSucceeded {
-					return core.RoundSummary{
-						Round: state.Round, Status: core.RoundFailed,
-						Summary: "check failed", Steps: steps,
-					}, false, "", nil
-				}
-			}
-			steps = append(steps, brainResult)
-			return core.RoundSummary{
-				Round: state.Round, Status: core.RoundSucceeded,
-				Summary: decision.Reason, Steps: steps,
-			}, true, core.StopFinished, nil
-		}
-
-		if decision.Action == "ask_user" {
-			// Wait for user input with a specific key.
-			askKey := core.AskRequestID(state.GoalID, state.Round)
-			sig := awaitSignal(ctx, state, SignalUserInput, askKey, 30*time.Minute)
-			if sig == nil {
-				state.Spec.Version = "waiting"
-				steps = append(steps, brainResult)
-				return core.RoundSummary{
-					Round: state.Round, Status: core.RoundFailed,
-					Summary: "ask_user timed out", Steps: steps,
-				}, false, "", nil
-			}
-			steps = append(steps, brainResult)
-			return core.RoundSummary{
-				Round: state.Round, Status: core.RoundSucceeded,
-				Summary: "ask_user answered", Steps: steps,
-			}, false, "", nil
-		}
-
-		// dispatch: run member steps.
-		memberResults := dispatchMembers(ctx, state, decision)
-		steps = append(steps, brainResult)
-		steps = append(steps, memberResults...)
-
-		state.CurrArtifacts = 0
-		for _, s := range memberResults {
-			state.CurrArtifacts += len(s.Artifacts)
-		}
+	var out roundOutcome
+	if st.Spec.Strategy == "brain" {
+		out = r.brainRound()
 	} else {
-		strategy := core.NewStrategy(state.Spec.Strategy)
-		if strategy == nil {
-			return core.RoundSummary{}, false, "", fmt.Errorf("unknown strategy: %s", state.Spec.Strategy)
-		}
-		st := strategy.Init(state.Spec)
-		plans := strategy.Next(st, state.Round)
-
-		for _, plan := range plans {
-			result, err := runMemberStep(ctx, state, plan)
-			if err != nil {
-				return core.RoundSummary{}, false, "", err
-			}
-			steps = append(steps, result)
-		}
-		strategy.Absorb(st, steps)
+		out = r.deterministicRound()
+	}
+	if r.cancelled {
+		return nil, r.finish(core.GoalCancelled, core.StopCancelled)
 	}
 
-	if core.CheckNoProgress(state.PrevSummary, state.PrevArtifacts, getSummary(steps), state.CurrArtifacts) {
-		state.NoProgress++
+	// 第 8 步：汇总本轮。
+	if out.status == core.RoundSucceeded {
+		st.FailStreak = 0
+	} else if out.countFailure {
+		st.FailStreak++
+	}
+	if out.trackProgress {
+		newArtifacts := 0
+		for _, s := range out.steps {
+			newArtifacts += len(s.Artifacts)
+		}
+		if core.CheckNoProgress(st.Progress, 0, out.progress, newArtifacts) {
+			st.NoProgress++
+		} else {
+			st.NoProgress = 0
+		}
+	}
+	if out.progress != "" {
+		st.Progress = truncate(out.progress, 4096)
+	}
+	if out.members != nil {
+		st.LastResults = out.members
+	}
+	if out.consumedNotes {
+		st.PendingNotes = nil
+	}
+
+	summary := core.RoundSummary{Round: st.Round, Status: out.status, Summary: out.progress, Steps: out.steps}
+	_ = r.call(ActSaveRoundSummary, SaveRoundSummaryReq{GoalID: st.GoalID, Summary: summary}, nil)
+	if out.status == core.RoundSucceeded {
+		r.emit("round.accepted", map[string]any{"round": st.Round, "summary": out.progress})
 	} else {
-		state.NoProgress = 0
+		r.emit("round.rejected", map[string]any{"round": st.Round, "summary": out.progress})
 	}
 
-	stop, reason = checkStop(state)
-
-	return core.RoundSummary{
-		Round:   state.Round,
-		Status:  core.AggregateRound(steps),
-		Summary: getSummary(steps),
-		Steps:   steps,
-	}, stop, reason, nil
-}
-
-// checkStop checks whether the goal should stop.
-func checkStop(state *WorkflowState) (bool, core.StopReason) {
-	summary := state.Progress
-	if state.Decision != nil {
-		summary = state.Decision.Reason
-	}
-	return core.CheckStopConditions(
-		state.Spec, state.Round,
-		state.FailStreak, state.NoProgress,
-		state.PrevSummary, state.PrevArtifacts,
-		summary, state.CurrArtifacts,
-		state.Budget.TokensUsed,
-	)
-}
-
-// drainSignals non-blockingly reads all pending signals from the event channel
-// and stores them in the workflow state's inbox.
-func drainSignals(ctx *workflow.WorkflowContext, state *WorkflowState) {
-	for {
-		task := ctx.WaitForExternalEvent("signal", 0)
-		var raw json.RawMessage
-		if err := task.Await(&raw); err != nil {
-			return // no more signals
+	switch {
+	case out.finished:
+		return nil, r.finish(core.GoalSucceeded, core.StopFinished)
+	case st.Spec.Kind == core.KindTask:
+		// Task = 只有 1 轮、无完成判定的 Goal（spec §4.1）。
+		if out.status == core.RoundSucceeded {
+			return nil, r.finish(core.GoalSucceeded, core.StopFinished)
 		}
-		var sig Signal
-		if err := json.Unmarshal(raw, &sig); err != nil {
-			continue
-		}
-		sigCopy := sig // copy for safety
-		state.PendingSignals = append(state.PendingSignals, &sigCopy)
+		return nil, r.finish(core.GoalFailed, core.StopError)
+	}
+
+	r.project(core.GoalRunning, "")
+	ctx.ContinueAsNew(st, workflow.WithKeepUnprocessedEvents())
+	return nil, nil
+}
+
+// roundOutcome is what a round strategy hands back to the round loop.
+type roundOutcome struct {
+	status        core.RoundStatus
+	steps         []core.StepResult
+	members       []core.StepResult // nil = keep LastResults unchanged
+	progress      string
+	finished      bool
+	countFailure  bool // failed round counts towards FailStreak
+	trackProgress bool // participates in NoProgress
+	consumedNotes bool
+}
+
+func (r *run) deterministicRound() roundOutcome {
+	st := r.st
+	strategy := core.NewStrategy(st.Spec.Strategy)
+	if strategy == nil {
+		return roundOutcome{status: core.RoundFailed, progress: "unknown strategy " + st.Spec.Strategy, countFailure: true}
+	}
+	sst := strategy.Init(st.Spec)
+	for _, res := range st.LastResults {
+		sst.Artifacts = append(sst.Artifacts, res.Artifacts...)
+	}
+	plans := strategy.Next(sst, st.Round)
+	steps := make([]*stepRun, 0, len(plans))
+	for _, p := range plans {
+		ds := core.DispatchStep{ID: p.ID, Role: p.Role, Instruction: p.Instruction, Inputs: p.Inputs}
+		steps = append(steps, r.newStep(ds, false, buildMemberPrompt(st, ds)))
+	}
+	if r.runSteps(steps) {
+		return roundOutcome{}
+	}
+	results := stepResults(steps)
+	status := core.AggregateRound(results)
+	return roundOutcome{
+		status:        status,
+		steps:         results,
+		members:       results,
+		progress:      firstSummary(results),
+		finished:      core.DeterministicDone(st.Spec, st.Round, results),
+		countFailure:  true,
+		trackProgress: true,
+		consumedNotes: true,
 	}
 }
 
-// awaitSignal waits for a signal with the given kind and key.
-// First checks the inbox; if not found, waits for the event.
-// Returns nil if the deadline is exceeded.
-func awaitSignal(ctx *workflow.WorkflowContext, state *WorkflowState, kind string, key string, timeout time.Duration) *Signal {
-	deadline := ctx.CurrentTimeUTC().Add(timeout)
+// brainRound: brain step → ParseDecision + validation (2 tries) → finish /
+// ask_user / dispatch members (spec §5.2 第 3 步, §5.3).
+func (r *run) brainRound() roundOutcome {
+	st := r.st
+	var all []core.StepResult
+	feedback := ""
+	var decision core.Decision
+	valid := false
+	for try := 1; try <= 2 && !valid; try++ {
+		stepID := "brain"
+		if try > 1 {
+			stepID = fmt.Sprintf("brain-%d", try)
+		}
+		bs := r.newStep(core.DispatchStep{ID: stepID, Role: st.Spec.Brain}, true, buildBrainPrompt(st, feedback))
+		if r.runSteps([]*stepRun{bs}) {
+			return roundOutcome{}
+		}
+		res := bs.Result
+		if res.Status != core.StepSucceeded {
+			all = append(all, res)
+			return roundOutcome{status: core.RoundFailed, steps: all, progress: "brain step failed: " + res.Reason, countFailure: true}
+		}
+		d, err := core.ParseDecision(res.Output)
+		if err != nil {
+			feedback = "your previous output could not be parsed: " + err.Error()
+		} else if vs := core.ValidateDecision(d, r.validationContext()); len(vs) > 0 {
+			msgs := make([]string, len(vs))
+			for i, v := range vs {
+				msgs[i] = v.String()
+			}
+			feedback = "your previous decision was rejected:\n" + strings.Join(msgs, "\n")
+		} else {
+			decision = d
+			valid = true
+		}
+		if valid {
+			res.Decision = &decision
+			res.Summary = decision.Summary
+		} else {
+			res.Status = core.StepFailed
+			res.Reason = "invalid_decision"
+			res.Summary = feedback
+			r.emit("decision.rejected", map[string]any{"stepID": stepID, "feedback": feedback})
+		}
+		all = append(all, res)
+	}
+	if !valid {
+		// 连续 2 次解析 / 校验失败计入 FailStreak（spec §5.3）。
+		return roundOutcome{status: core.RoundRejected, steps: all, progress: st.Progress, countFailure: true}
+	}
 
-	for {
-		// Linear scan of inbox for a matching signal.
-		for i, sig := range state.PendingSignals {
-			if sig.Kind == kind && sig.Key == key {
-				// Remove from inbox and return.
-				s := state.PendingSignals[i]
-				state.PendingSignals = append(state.PendingSignals[:i], state.PendingSignals[i+1:]...)
-				return s
+	switch decision.Action {
+	case "finish":
+		if st.Spec.Check != nil {
+			check := r.runCheck()
+			all = append(all, check)
+			if check.Status != core.StepSucceeded {
+				return roundOutcome{status: core.RoundFailed, steps: all, members: []core.StepResult{check}, progress: decision.Summary, countFailure: true, consumedNotes: true}
 			}
 		}
+		return roundOutcome{status: core.RoundSucceeded, steps: all, progress: decision.Summary, finished: true, consumedNotes: true}
 
-		// Check if deadline exceeded.
-		remaining := deadline.Sub(ctx.CurrentTimeUTC())
-		if remaining <= 0 {
-			return nil
-		}
+	case "ask_user":
+		return r.askUser(decision, all)
+	}
 
-		// Wait for next signal.
-		task := ctx.WaitForExternalEvent("signal", remaining)
-		var raw json.RawMessage
-		if err := task.Await(&raw); err != nil {
-			return nil
-		}
-		var sig Signal
-		if err := json.Unmarshal(raw, &sig); err != nil {
-			continue
-		}
-		sigCopy := sig
-
-		if sig.Kind == kind && sig.Key == key {
-			return &sigCopy
-		}
-
-		// Not the one we want; store in inbox and keep looking.
-		state.PendingSignals = append(state.PendingSignals, &sigCopy)
+	members := make([]*stepRun, 0, len(decision.Steps))
+	for _, ds := range decision.Steps {
+		members = append(members, r.newStep(ds, false, buildMemberPrompt(st, ds)))
+	}
+	if r.runSteps(members) {
+		return roundOutcome{}
+	}
+	results := stepResults(members)
+	all = append(all, results...)
+	return roundOutcome{
+		status:        core.AggregateRound(results),
+		steps:         all,
+		members:       results,
+		progress:      decision.Summary,
+		countFailure:  true,
+		trackProgress: true,
+		consumedNotes: true,
 	}
 }
 
-// tryReadControl attempts to read a control signal from the inbox.
-func tryReadControl(ctx *workflow.WorkflowContext, state *WorkflowState) *ControlSignal {
-	for i, sig := range state.PendingSignals {
-		if sig.Kind == SignalControl {
-			s := state.PendingSignals[i]
-			state.PendingSignals = append(state.PendingSignals[:i], state.PendingSignals[i+1:]...)
-			var ctrl ControlSignal
-			_ = json.Unmarshal(s.Data, &ctrl)
-			return &ctrl
+// askUser waits for the user's answer (spec §5.3): the goal is waiting, no
+// slot is held; timeout → paused(ask_timeout).
+func (r *run) askUser(d core.Decision, all []core.StepResult) roundOutcome {
+	st := r.st
+	reqID := core.AskRequestID(st.GoalID, st.Round, 1)
+	timeout := parseDuration(st.Spec.Limits.AskTimeout, defaultAskTimeout)
+	ask := &core.AskState{RequestID: reqID, Question: d.Question, ExpiresAt: r.now().Add(timeout)}
+	r.emit("goal.waiting", map[string]any{"reason": "ask_user", "requestID": reqID, "question": d.Question})
+	r.projectAsk(ask)
+
+	deadline := ask.ExpiresAt
+	r.resumed = false
+	for !r.cancelled && !r.resumed {
+		remaining := deadline.Sub(r.now())
+		sig, timedOut := r.wait(remaining, func(s *Signal) bool { return s.Kind == SignalUserInput && s.Key == reqID })
+		if sig != nil {
+			var in UserInput
+			_ = jsonUnmarshal(sig.Data, &in)
+			st.PendingNotes = append(st.PendingNotes, "[answer to: "+d.Question+"] "+in.Note)
+			r.emit("goal.resumed", map[string]any{"requestID": reqID})
+			return roundOutcome{status: core.RoundSucceeded, steps: all, progress: d.Summary}
+		}
+		if timedOut {
+			st.Paused = true
+			r.emit("goal.paused", map[string]any{"reason": "ask_timeout", "requestID": reqID})
+			return roundOutcome{status: core.RoundSucceeded, steps: all, progress: d.Summary}
 		}
 	}
-	return nil
+	if r.cancelled {
+		return roundOutcome{}
+	}
+	// resume 不带回答：直接进入下一轮。
+	r.emit("goal.resumed", map[string]any{"requestID": reqID})
+	return roundOutcome{status: core.RoundSucceeded, steps: all, progress: d.Summary}
 }
 
-// waitForResume waits for a resume signal.
-func waitForResume(ctx *workflow.WorkflowContext, state *WorkflowState) bool {
-	for {
-		// First check inbox.
-		for i, sig := range state.PendingSignals {
-			if sig.Kind == SignalControl {
-				s := state.PendingSignals[i]
-				state.PendingSignals = append(state.PendingSignals[:i], state.PendingSignals[i+1:]...)
-				var ctrl ControlSignal
-				_ = json.Unmarshal(s.Data, &ctrl)
-				if ctrl.Action == "resume" {
-					return true
-				}
-				if ctrl.Action == "cancel" {
-					return false
-				}
-			}
-		}
+func (r *run) runCheck() core.StepResult {
+	var res core.StepResult
+	req := RunCheckReq{GoalID: r.st.GoalID, Command: r.st.Spec.Check.Command, Workspace: r.st.Spec.Check.Workspace}
+	if err := r.call(ActRunCheck, req, &res); err != nil {
+		return core.StepResult{StepID: "check", Role: "_check", Status: core.StepFailed, Reason: err.Error()}
+	}
+	return res
+}
 
-		// Wait for next signal (no timeout).
-		task := ctx.WaitForExternalEvent("signal", 0)
-		var raw json.RawMessage
-		if err := task.Await(&raw); err != nil {
-			return false
-		}
-		var sig Signal
-		if err := json.Unmarshal(raw, &sig); err != nil {
-			continue
-		}
-		sigCopy := sig
-		state.PendingSignals = append(state.PendingSignals, &sigCopy)
+func (r *run) validationContext() core.ValidationContext {
+	ws := make([]string, 0, len(r.st.Spec.Workspaces))
+	for name := range r.st.Spec.Workspaces {
+		ws = append(ws, name)
+	}
+	sort.Strings(ws)
+	mounts := make([]string, 0, len(r.st.Spec.Inputs))
+	for name := range r.st.Spec.Inputs {
+		mounts = append(mounts, name)
+	}
+	sort.Strings(mounts)
+	return core.ValidationContext{
+		MemberRoles:       r.st.Spec.Members,
+		ExistingArtifacts: r.st.Artifacts,
+		InputMounts:       mounts,
+		Workspaces:        ws,
+		MaxStepsPerRound:  r.st.Spec.Limits.MaxStepsPerRound,
+		MaxTokens:         r.st.Spec.Limits.MaxTokens,
 	}
 }
 
-func getSummary(steps []core.StepResult) string {
+// finish releases everything this goal holds and writes the terminal
+// projection (spec §5.2 第 9 步 / cancel).
+func (r *run) finish(status core.GoalStatus, reason core.StopReason) error {
+	r.emit("goal.finished", map[string]any{"status": status, "reason": reason})
+	return r.call(ActFinishGoal, FinishGoalReq{
+		GoalID: r.st.GoalID,
+		State:  r.goalState(status, string(reason)),
+		Events: r.takeEvents(),
+	}, nil)
+}
+
+// emit allocates a deterministic event seq; the event is persisted by the
+// next project / finish activity.
+func (r *run) emit(typ string, data any) {
+	r.st.EventSeq++
+	r.events = append(r.events, core.Event{Seq: r.st.EventSeq, Type: typ, At: r.now(), Data: data})
+}
+
+func (r *run) takeEvents() []core.Event {
+	ev := r.events
+	r.events = nil
+	return ev
+}
+
+func (r *run) goalState(status core.GoalStatus, reason string) core.GoalState {
+	gs := core.GoalState{
+		ID:        r.st.GoalID,
+		Kind:      r.st.Spec.Kind,
+		Status:    status,
+		Round:     r.st.Round,
+		Progress:  core.Progress{Summary: r.st.Progress},
+		Budget:    r.st.Budget,
+		Reason:    reason,
+		UpdatedAt: r.now(),
+	}
+	gs.Budget.TokensLimit = r.st.Spec.Limits.MaxTokens
+	return gs
+}
+
+// project writes pending events and the goal projection (spec §6 投影只由 Activity 写).
+func (r *run) project(status core.GoalStatus, reason string) {
+	r.projectState(r.goalState(status, reason))
+}
+
+func (r *run) projectAsk(ask *core.AskState) {
+	gs := r.goalState(core.GoalWaiting, "ask_user")
+	gs.Ask = ask
+	r.projectState(gs)
+}
+
+func (r *run) projectState(gs core.GoalState) {
+	_ = r.call(ActProject, ProjectReq{GoalID: r.st.GoalID, State: gs, Events: r.takeEvents(), EventSeq: r.st.EventSeq}, nil)
+}
+
+// call runs an activity with its per-type retry policy (spec §5.2 表) and
+// decodes the result into out (may be nil).
+func (r *run) call(name string, in, out any) error {
+	opts := []workflow.CallActivityOption{workflow.WithActivityInput(in)}
+	if p := activityRetryPolicy(name); p != nil {
+		opts = append(opts, workflow.WithActivityRetryPolicy(p))
+	}
+	return r.ctx.CallActivity(name, opts...).Await(out)
+}
+
+func stepResults(steps []*stepRun) []core.StepResult {
+	out := make([]core.StepResult, 0, len(steps))
+	for _, s := range steps {
+		out = append(out, s.Result)
+	}
+	return out
+}
+
+func firstSummary(steps []core.StepResult) string {
 	for _, s := range steps {
 		if s.Summary != "" {
 			return s.Summary
@@ -399,283 +422,16 @@ func getSummary(steps []core.StepResult) string {
 	return ""
 }
 
-func finalizeGoal(ctx *workflow.WorkflowContext, state *WorkflowState, reason core.StopReason) {
-	status := mapStopReasonToGoalStatus(reason)
-	task := ctx.CallActivity(FinishGoal, workflow.WithActivityInput(FinishGoalReq{
-		GoalID: state.GoalID,
-		Status: status,
-		Reason: string(reason),
-	}))
-	_ = task.Await(nil)
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }
 
-// mapStopReasonToGoalStatus maps a stop reason to the appropriate goal status.
-func mapStopReasonToGoalStatus(reason core.StopReason) core.GoalStatus {
-	switch reason {
-	case core.StopFinished:
-		return core.GoalSucceeded
-	case core.StopCancelled:
-		return core.GoalCancelled
-	default:
-		return core.GoalFailed
+func jsonUnmarshal(data json.RawMessage, v any) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty payload")
 	}
-}
-
-// acquireThenSubmit acquires a slot, waits if needed, submits the attempt,
-// polls until terminal, and releases the slot. Returns the step result.
-func acquireThenSubmit(
-	ctx *workflow.WorkflowContext,
-	state *WorkflowState,
-	stepID string,
-	role string,
-	executor string,
-	account string,
-	prompt string,
-	inputs []string,
-	affinityWorker string,
-) core.StepResult {
-	attemptKey := core.AttemptKey(state.GoalID, state.Round, stepID, 1)
-
-	// Acquire a slot from the scheduler actor.
-	acquireTask := ctx.CallActivity(AcquireSlot, workflow.WithActivityInput(AcquireSlotReq{
-		WaiterInstanceID: state.GoalID,
-		AttemptKey:       attemptKey,
-		Executor:         executor,
-		Account:          account,
-		PreferWorker:     affinityWorker,
-	}))
-	var slotResp AcquireSlotResp
-	if err := acquireTask.Await(&slotResp); err != nil {
-		return core.StepResult{StepID: stepID, Role: role, Status: core.StepFailed}
-	}
-
-	var lease *LeaseInfo
-	if slotResp.Granted && slotResp.Lease != nil {
-		lease = slotResp.Lease
-	} else {
-		// Wait for slot-granted signal.
-		sig := awaitSignal(ctx, state, SignalSlotGranted, attemptKey, 5*time.Minute)
-		if sig == nil {
-			return core.StepResult{StepID: stepID, Role: role, Status: core.StepFailed}
-		}
-		var data struct {
-			Lease *LeaseInfo `json:"lease"`
-		}
-		if err := json.Unmarshal(sig.Data, &data); err != nil || data.Lease == nil {
-			return core.StepResult{StepID: stepID, Role: role, Status: core.StepFailed}
-		}
-		lease = data.Lease
-	}
-
-	// Submit the attempt with the lease.
-	sessionPolicy := lease.SessionPolicy
-	if sessionPolicy == "" {
-		sessionPolicy = "fresh"
-	}
-
-	req := SubmitAttemptReq{
-		GoalID:        state.GoalID,
-		AttemptKey:    attemptKey,
-		Round:         state.Round,
-		Role:          role,
-		WorkerID:      lease.WorkerID,
-		Executor:      lease.Executor,
-		Account:       lease.Account,
-		Prompt:        prompt,
-		SessionPolicy: sessionPolicy,
-		Inputs:        inputs,
-	}
-
-	submitTask := ctx.CallActivity(SubmitAttempt, workflow.WithActivityInput(req))
-	var submitResp SubmitAttemptResp
-	if err := submitTask.Await(&submitResp); err != nil {
-		// Release slot on submit failure.
-		releaseTask := ctx.CallActivity(ReleaseSlot, workflow.WithActivityInput(ReleaseSlotReq{
-			AttemptKey: attemptKey,
-		}))
-		_ = releaseTask.Await(nil)
-		return core.StepResult{StepID: stepID, Role: role, Status: core.StepFailed}
-	}
-
-	// Poll until terminal status.
-	pollReq := PollAttemptReq{
-		GoalID:       state.GoalID,
-		AttemptKey:   attemptKey,
-		RemoteTaskID: submitResp.RemoteTaskID,
-		WorkerID:     lease.WorkerID,
-		Executor:     lease.Executor,
-		Round:        state.Round,
-	}
-
-	var pollResp PollAttemptResp
-	for {
-		pollTask := ctx.CallActivity(PollAttempt, workflow.WithActivityInput(pollReq))
-		if err := pollTask.Await(&pollResp); err != nil {
-			break
-		}
-
-		if pollResp.Status == core.AttemptCompleted {
-			// Release slot.
-			releaseTask := ctx.CallActivity(ReleaseSlot, workflow.WithActivityInput(ReleaseSlotReq{
-				AttemptKey: attemptKey,
-			}))
-			_ = releaseTask.Await(nil)
-			return core.StepResult{
-				StepID:    stepID,
-				Role:      role,
-				Status:    core.StepSucceeded,
-				Summary:   pollResp.Summary,
-				Artifacts: pollResp.Artifacts,
-				Usage:     pollResp.Usage,
-			}
-		}
-		if pollResp.Status == core.AttemptFailed || pollResp.Status == core.AttemptRejected {
-			break
-		}
-		ctx.CreateTimer(5 * time.Second)
-	}
-
-	// Terminal failure — release slot.
-	releaseTask := ctx.CallActivity(ReleaseSlot, workflow.WithActivityInput(ReleaseSlotReq{
-		AttemptKey: attemptKey,
-	}))
-	_ = releaseTask.Await(nil)
-
-	return core.StepResult{StepID: stepID, Role: role, Status: core.StepFailed}
-}
-
-// runBrainStep executes the brain step.
-func runBrainStep(ctx *workflow.WorkflowContext, state *WorkflowState) (core.StepResult, error) {
-	prompt := buildBrainPrompt(state)
-
-	result := acquireThenSubmit(
-		ctx, state,
-		"brain", state.Spec.Brain,
-		getExecutor(state.Spec.Brain), getAccount(state.Spec.Brain),
-		prompt, nil,
-		state.Spec.Brain, // affinity to same brain
-	)
-
-	// Parse decision from summary for brain steps.
-	// For M0, the brain's response is a JSON decision in the summary.
-	if result.Status == core.StepSucceeded {
-		var decision core.Decision
-		if err := json.Unmarshal([]byte(result.Summary), &decision); err == nil {
-			result.Decision = &decision
-		} else {
-			// Not JSON — brain returned plain text; treat as finish.
-			result.Decision = &core.Decision{
-				Action: "finish",
-				Done:   true,
-				Reason: result.Summary,
-			}
-		}
-	}
-
-	return result, nil
-}
-
-// dispatchMembers dispatches member steps in parallel.
-func dispatchMembers(ctx *workflow.WorkflowContext, state *WorkflowState, decision *core.Decision) []core.StepResult {
-	results := make([]core.StepResult, 0, len(decision.Steps))
-	for i, step := range decision.Steps {
-		stepID := fmt.Sprintf("member%d", i)
-		prompt := buildMemberPrompt(state, step)
-
-		result := acquireThenSubmit(
-			ctx, state,
-			stepID, step.Role,
-			getExecutor(step.Role), getAccount(step.Role),
-			prompt, step.Inputs,
-			"", // no affinity for member steps
-		)
-		results = append(results, result)
-	}
-	return results
-}
-
-// runMemberStep executes a single member step for deterministic strategies.
-func runMemberStep(ctx *workflow.WorkflowContext, state *WorkflowState, plan core.StepPlan) (core.StepResult, error) {
-	prompt := buildMemberPrompt(state, core.DispatchStep{
-		Role:        plan.Role,
-		Instruction: plan.Instruction,
-		Inputs:      plan.Inputs,
-	})
-
-	return acquireThenSubmit(
-		ctx, state,
-		"step", plan.Role,
-		getExecutor(plan.Role), getAccount(plan.Role),
-		prompt, plan.Inputs,
-		"",
-	), nil
-}
-
-// runCheck executes the goal-level check.
-func runCheck(ctx *workflow.WorkflowContext, state *WorkflowState) (core.StepResult, error) {
-	check := state.Spec.Check
-	if check == nil {
-		return core.StepResult{StepID: "check", Role: "_check", Status: core.StepSucceeded}, nil
-	}
-
-	req := RunCheckReq{
-		GoalID:    state.GoalID,
-		Command:   check.Command,
-		Workspace: check.Workspace,
-	}
-
-	task := ctx.CallActivity(RunCheck, workflow.WithActivityInput(req))
-	var result core.StepResult
-	if err := task.Await(&result); err != nil {
-		return core.StepResult{StepID: "check", Role: "_check", Status: core.StepFailed}, err
-	}
-	return result, nil
-}
-
-// getExecutor returns the executor for a role (simplified - would read from roles.yaml).
-func getExecutor(role string) string {
-	return "pi"
-}
-
-// getAccount returns the account for a role.
-func getAccount(role string) string {
-	return "default"
-}
-
-// buildBrainPrompt assembles the brain prompt (spec §7.1).
-func buildBrainPrompt(state *WorkflowState) string {
-	var parts []string
-	parts = append(parts, "[role instructions]")
-	parts = append(parts, "[team]")
-	for _, m := range state.Spec.Members {
-		parts = append(parts, m)
-	}
-	parts = append(parts, "[objective]")
-	parts = append(parts, state.Spec.Objective)
-	if state.Spec.Acceptance != "" {
-		parts = append(parts, "[acceptance]")
-		parts = append(parts, state.Spec.Acceptance)
-	}
-	parts = append(parts, "[progress]")
-	parts = append(parts, state.Progress)
-	parts = append(parts, "[limits]")
-	parts = append(parts, fmt.Sprintf("maxRounds=%d", state.Spec.Limits.MaxRounds))
-	return core.JoinInstructions(parts)
-}
-
-// buildMemberPrompt assembles a member prompt (spec §7.1).
-func buildMemberPrompt(state *WorkflowState, step core.DispatchStep) string {
-	var parts []string
-	parts = append(parts, "[role instructions]")
-	parts = append(parts, "[instruction]")
-	parts = append(parts, step.Instruction)
-	if len(step.Inputs) > 0 {
-		parts = append(parts, "[inputs]")
-		for _, input := range step.Inputs {
-			parts = append(parts, input)
-		}
-	}
-	parts = append(parts, "[output contract]")
-	parts = append(parts, `{"summary": "...", "done": false, "artifacts": []}`)
-	return core.JoinInstructions(parts)
+	return json.Unmarshal(data, v)
 }

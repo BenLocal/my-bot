@@ -33,6 +33,9 @@ type GoalSpec struct {
 
 	Check *Check `json:"check,omitempty"`
 
+	// Roles 是创建时固化的角色定义快照（brain 与 members），在途 Goal 不受 roles.yaml 变更影响（spec §5.2）。
+	Roles map[string]Role `json:"roles,omitempty"`
+
 	Version string `json:"version,omitempty"` // Spec 版本，用于 Workflow 重放兼容
 }
 
@@ -53,6 +56,9 @@ type Limits struct {
 	FailStreak       int        `json:"failStreak,omitempty"` // 连续失败轮数上限
 	NoProgress       int        `json:"noProgress,omitempty"` // 连续无进展轮数上限
 	MaxStepsPerRound int        `json:"maxStepsPerRound,omitempty"`
+	AskTimeout       string     `json:"askTimeout,omitempty"`   // ask_user 等待上限，缺省 24h
+	OrphanAfter      string     `json:"orphanAfter,omitempty"`  // Worker 注册过期多久判孤儿，缺省 5m
+	AffinityWait     string     `json:"affinityWait,omitempty"` // 会话亲和等待上限，缺省 5m
 }
 
 type Schedule struct {
@@ -75,6 +81,10 @@ type Role struct {
 	Instructions string   `json:"instructions"`
 	Timeout      string   `json:"timeout"`
 	Capabilities []string `json:"capabilities,omitempty"`
+
+	// 创建 Goal 时固化的指令正文及其 sha256（spec §8 创建流程）。
+	InstructionsText   string `json:"instructionsText,omitempty"`
+	InstructionsSha256 string `json:"instructionsSha256,omitempty"`
 }
 
 // WorkerRecord is a worker instance in the registry.
@@ -182,7 +192,16 @@ type GoalState struct {
 	Round     int        `json:"round"`
 	Progress  Progress   `json:"progress"`
 	Budget    Budget     `json:"budget"`
+	Reason    string     `json:"reason,omitempty"` // 终态 / waiting / paused 的原因
+	Ask       *AskState  `json:"ask,omitempty"`    // 等待中的 ask_user
 	UpdatedAt time.Time  `json:"updatedAt"`
+}
+
+// AskState 是等待中的 ask_user 请求（spec §5.3）。
+type AskState struct {
+	RequestID string    `json:"requestID"`
+	Question  string    `json:"question"`
+	ExpiresAt time.Time `json:"expiresAt"`
 }
 
 type GoalStatus string
@@ -219,6 +238,11 @@ type StepResult struct {
 	Role      string        `json:"role"`
 	Status    StepStatus    `json:"status"`
 	Summary   string        `json:"summary"`
+	Done      bool          `json:"done,omitempty"` // 成员 output contract 的 done（确定性策略判完成用）
+	Output    string        `json:"output,omitempty"`
+	Reason    string        `json:"reason,omitempty"` // 失败原因
+	Attempt   int           `json:"attempt,omitempty"`
+	WorkerID  string        `json:"workerID,omitempty"`
 	Artifacts []ArtifactRef `json:"artifacts,omitempty"`
 	Usage     Usage         `json:"usage,omitempty"`
 	Decision  *Decision     `json:"decision,omitempty"` // for brain steps
@@ -233,23 +257,22 @@ type RoundSummary struct {
 }
 
 // Decision is the structured decision output by the brain.
+// 字段与 spec §5.3 的决策 JSON 一一对应。
 type Decision struct {
 	Action   string         `json:"action"` // dispatch | finish | ask_user
+	Summary  string         `json:"summary,omitempty"`
 	Steps    []DispatchStep `json:"steps,omitempty"`
 	Done     bool           `json:"done,omitempty"`
-	Reason   string         `json:"reason,omitempty"`
-	AskUser  *AskUser       `json:"askUser,omitempty"`
+	Question string         `json:"question,omitempty"` // ask_user 时必填
 	Memories []MemoryEntry  `json:"memories,omitempty"`
 }
 
 type DispatchStep struct {
+	ID          string   `json:"id"`
 	Role        string   `json:"role"`
 	Instruction string   `json:"instruction"`
-	Inputs      []string `json:"inputs,omitempty"` // artifact URIs
-}
-
-type AskUser struct {
-	Question string `json:"question"`
+	Inputs      []string `json:"inputs,omitempty"` // 产物引用 r<round>/<stepID>/<name>
+	Workspace   string   `json:"workspace,omitempty"`
 }
 
 type MemoryEntry struct {

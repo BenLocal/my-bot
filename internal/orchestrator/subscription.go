@@ -55,8 +55,9 @@ func (h *SubscriptionHandler) Handle(ctx context.Context, topic string, data []b
 		Key:  event.AttemptKey,
 	}
 
-	err := h.client.RaiseEvent(ctx, event.GoalID, "signal", workflow.WithEventPayload(signal))
+	err := h.client.RaiseEvent(ctx, event.GoalID, signalEventName, workflow.WithEventPayload(signal))
 	if err == nil {
+		h.logger.Debug("attempt-event delivered", "goalID", event.GoalID, "attemptKey", event.AttemptKey, "status", event.Status)
 		return SubscriptionSuccess
 	}
 
