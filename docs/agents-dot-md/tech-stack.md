@@ -24,11 +24,19 @@
 
 同类能力已有选型时不引入第二套（HTTP 路由、日志、配置库各只用一种，首次引入时记录在此）。
 
+已引入的通用库（M0）：
+- HTTP 路由：标准库 `net/http`（1.22+ 路由）。`github.com/go-chi/chi/v5` 只因 `daprhttp.NewServiceWithMux` 要求 chi Mux 而出现在 `cmd/mybot-runtime`，业务路由不用它。
+- 日志：`log/slog`（Runtime 输出 JSON 到 stdout）。
+- 配置解析：`gopkg.in/yaml.v3`（`config/roles.yaml`，`core.ParseRolesConfig`）。
+- ID：`github.com/oklog/ulid/v2`（goalID）、`github.com/google/uuid`（uuid5 会话 ID）。
+
 ## 三、存储约定
 
 - 所有持久化经 Dapr State API，封装在 `internal/store`；业务代码不直连 Redis。
 - 键名规范见 spec §6；并发写用 ETag。Redis 上的 State 事务失败时不回滚，跨键更新用「顺序写 + 每步幂等 + 对账修复」，不依赖事务原子性。
 - 首次写入去重（attemptKey、Idempotency-Key）用条件写，不先读后写。
+- Redis 上带 ETag 的写 / 删必须用 `first-write` 并发模式（SDK 默认 last-write 会忽略 ETag），见 spec §6 与 `docs/memory/m0-development-decisions.md`；`internal/store` 已封装，业务代码不要直接调 SDK。
+- 测试用内存实现 `store.NewMemStore()`（同样的 ETag / first-write / TTL 语义）。
 
 ## 四、配置
 
@@ -44,13 +52,12 @@ go test ./...
 go test -race ./internal/...          # 并发相关改动必跑
 go build ./cmd/...
 
-# 本地联调（M0 起，组件在 deploy/dapr/local/）
-docker run -d --name mybot-redis -p 6379:6379 redis --appendonly yes
-dapr run --app-id mybot-runtime --resources-path deploy/dapr/local -- go run ./cmd/mybot-runtime
-dapr run --app-id mybot-worker-fake --resources-path deploy/dapr/local -- go run ./cmd/mybot-worker --executor fake
-```
+# 端到端验收（需要 dapr CLI + redis-server 或 docker，约 10 分钟）
+make test-e2e                          # MYBOT_E2E_LOGDIR=<dir> 保留各进程日志
 
-以上命令在对应代码落地后按实际情况修正。
+# 本地联调（Redis 容器 + sidecar + Runtime + N 个 fake Worker，组件在 deploy/dapr/local/）
+./scripts/dev/dev.sh 2                 # Ctrl-C 或 ./scripts/dev/stop.sh 停止
+```
 
 ## 六、部署
 

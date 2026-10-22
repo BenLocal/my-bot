@@ -380,6 +380,7 @@ Worker 在 Attempt 到终态时发布到 `attempt-events`：`{attemptKey, goalID
 
 - **不依赖跨键事务的原子性**（P0-1 实测）：Redis 上的 State 事务只有在全部成功时才原子；其中一条 ETag 条件写冲突时，同一事务中已执行的其他写入**不会回滚**。因此跨键更新（如「写 goal 投影 + 更新 active 索引」）一律改为**顺序写 + 每步幂等 + 定期对账修复**；条件写不与其他写放在同一事务里。
 - 冲突错误归一化：过期 ETag 返回 gRPC `Aborted`；first-write 遇到已存在的键返回 `Internal`，信息含 `failed to set key` / `possible etag mismatch`。`store` 层把两者都映射为 `ErrConflict`。
+- 条件写的并发模式（2026-10-22 实测）：Go SDK 默认 `CONCURRENCY_LAST_WRITE`，此模式下 Redis 组件**忽略 ETag**；且以 first-write 创建的键会留下 `first-write` 标记，之后任何不带 ETag 的写入（含 last-write）都返回 `failed to set key`。因此带 ETag 的写 / 删必须显式用 `first-write` 并发模式；对 first-write 创建的键做普通覆盖写时，`store` 先回读 ETag 再条件写（语义仍为 last-write）。
 - 索引（`registry:*:_index`、`goal:_index:*`）的修改统一走 `store.MutateIndex(key, func(ids) (ids, changed bool))`（参照 Dapr Agents `components.py` 的 `_mutate_team_index`）：读 ETag → 回调 → 未变化不写 → 条件写；冲突用 full-jitter 指数退避（50ms 起，上限 1s），总耗时预算 10s。
 - 注册顺序：先写单条记录，再加入索引；注销反过来，先删记录再出索引。读取时跳过索引中已不存在（含 TTL 过期）的记录。
 - TTL 只让单条记录过期，索引不会自动清理：Runtime 每 5 分钟用 `MutateIndex` 清掉指向不存在记录的 ID。
@@ -439,7 +440,9 @@ Worker 在 Attempt 到终态时发布到 `attempt-events`：`{attemptKey, goalID
 
 **工作区**（flow G9）：Goal 的 `workspaces` 声明具名工作区，可带 `git` 与 `ref`。首次被某个 Step 使用时，由执行该 Step 的 Worker 在共享卷上创建（有 `git` 则克隆，git 凭据走 Secret、只给 Worker）；同仓库并行写的 Step 用独立 git worktree（`<workspace>@<stepID>`）。是否允许 push 由 Role 权限控制，默认不允许。§5.3 第 5 条的「同 workspace 串行」仍然有效。
 
-`metadata` 还带：`mybot/goalID`、`mybot/round`、`mybot/workspace`（相对路径）、`mybot/sessionPolicy`（`reuse` 同 Goal 复用执行器会话 / `fresh`）。
+`metadata` 还带：`mybot/goalID`、`mybot/round`、`mybot/stepID`、`mybot/role`（Worker 派生 reuse 会话 ID 与产物路径用）、`mybot/workspace`（相对路径）、`mybot/sessionPolicy`（`reuse` 同 Goal 复用执行器会话 / `fresh`）。
+
+Worker 返回的 Task（`GetTask`、`GET /mybot/attempts/{attemptKey}`）在 `Task.metadata` 中带结果：`mybot/attemptStatus`（Attempt 状态，A2A 状态无法表达 `interrupted` / `unknown`，以此为准）、`mybot/reason`、`mybot/retryable`、`mybot/usage`（`{inputTokens, outputTokens}`）；每个产物的 `Artifact.metadata` 带 `mybot/uri`、`mybot/path`、`mybot/sha256`、`mybot/size`。Worker 重启后内存中的 Task 丢失，`GET /mybot/attempts/{attemptKey}` 回落到 `worker:<id>:attempt:<key>` 记录重建 Task（记录含 goalID、轮次、stepID、角色、结果正文与原因），所以 Runtime 一律按 attemptKey 查询。
 
 ### 7.2 Worker 内部：Driver 接口
 
@@ -541,12 +544,12 @@ Base：`/v1`，Bearer token（Secret `mybot-api-token`）。所有创建接口�
 | GET | `/goals?status=active` | 列表（Task/Loop 共用，`kind` 过滤） |
 | GET | `/goals/{id}` | 投影详情 |
 | GET | `/goals/{id}/events?after=<seq>` | 事件；`Accept: text/event-stream` 时 SSE 跟随（`id:` 字段为 `<goalID>:<seq>`，支持 `Last-Event-ID` 续传） |
-| GET | `/goals/{id}/rounds/{n}` | 轮次详情（attempts、usage、artifacts） |
+| GET | `/goals/{id}/rounds` `/goals/{id}/rounds/{n}` | 轮次列表 / 轮次详情（steps：状态、attempt 号、workerID、usage、artifacts） |
 | GET | `/goals/{id}/artifacts/r{round}/{stepID}/{name}` | 下载产物（Runtime 只读挂载共享卷，直接读取并校验 sha256） |
 | POST | `/goals/{id}:pause` `:resume` `:cancel` | 控制；pause 在当前轮结束后生效 |
 | POST | `/goals/{id}:append` | `{note, replyTo?}`，下一轮生效；`replyTo` 回答 `ask_user`（§5.3）；正文上限 64 KiB，超出返回 413 |
 | DELETE | `/goals/{id}` | （M2）仅终态 Goal：清理投影、事件、索引项与 Workflow 历史（purge） |
-| GET | `/workers` | 注册表、lease 与排队情况（Scheduler `Snapshot`） |
+| GET | `/workers` | `{workers: 注册表, scheduler: Snapshot}`；Snapshot 含 activeLeases、queued、每个 Worker 的 inflight、lease 与排队明细、账号状态、drain 列表 |
 | POST | `/workers/{id}:drain` `:undrain` | 停止 / 恢复向该 Worker 分配（§5.1） |
 | POST | `/accounts/{executor}/{account}:ok` | 用户重新登录后解除 `needs_auth` |
 | GET | `/memory?topic=&q=` | 列出 L1 主题 / 条目，`q` 为子串过滤；`/memory:recall?q=` 走 L2 语义召回（调试用） |
@@ -565,7 +568,8 @@ Base：`/v1`，Bearer token（Secret `mybot-api-token`）。所有创建接口�
   "maxParallel": 2,
   "inputs": {"mounts": ["notes:/inbox:ro"]},
   "workspaces": {"out": {}, "repo": {"git": "https://example.com/me/tool.git", "ref": "main"}},
-  "limits": {"maxRounds": 10, "deadline": "2026-10-28T00:00:00+08:00", "maxTokens": 2000000},
+  "limits": {"maxRounds": 10, "deadline": "2026-10-28T00:00:00+08:00", "maxTokens": 2000000,
+             "askTimeout": "24h", "orphanAfter": "5m", "affinityWait": "5m"},
   "check": {"command": "test -f index.md", "workspace": "out", "timeout": "10m"}
 }
 ```
@@ -606,7 +610,7 @@ k3s（单二进制、自带 local-path PVC、Traefik、ServiceLB），单节点�
 
 ## 10. 可观测性
 
-- 事件类型：`goal.created`、`round.started`、`slot.waiting`、`attempt.submitted`、`attempt.progress`（节流，≤1 条/10s）、`attempt.finished`、`round.accepted|rejected`、`goal.paused|resumed|waiting|finished`、`account.cooldown|needs_auth`。
+- 事件类型：`goal.created`、`round.started`、`slot.waiting`、`attempt.submitted`、`attempt.progress`（节流，≤1 条/10s）、`attempt.finished`、`round.accepted|rejected`、`decision.rejected`（大脑决策解析 / 校验失败，`data.feedback` 为回传大脑的原因）、`goal.paused|resumed|waiting|finished`、`account.cooldown|needs_auth`。事件序号由 Workflow 确定性分配（`GoalState.EventSeq`，`goal.created` 由创建接口写为 1），Activity 按序号覆盖写。
 - 日志：JSON 到 stdout，字段含 `goalID`、`round`、`attemptKey`、`workerID`。
 - 用量：执行器能报则记录，不能报记 `unknown`，不估算。
 - 通知（M2）：`goal.finished`、`goal.waiting`、`account.needs_auth` 推到一个 webhook（如飞书机器人），URL 来自 Secret。通知实现为可插拔的事件 listener（参照 Dapr Agents `streaming/listeners.py`），与 SSE 读取同一事件源，不另起一条推送路径。

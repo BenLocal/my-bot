@@ -36,13 +36,29 @@
 
 **修复**：终态写记录 / 发消息改用 `context.WithoutCancel(ctx)`，确保即使请求 context 已取消，终态仍能可靠落库并发布。
 
-## Dapr Redis State Store ETag 条件写入 bug（2026-10-21）
+## Dapr Redis State Store 条件写入（2026-10-21 记录，2026-10-22 更正）
 
-**现象**：`internal/store/index.go` 的 `writeIndex` 使用 `Set` with ETag 做条件写入，但 Dapr Redis state store 的 Lua 脚本中 `etag == ARGV[1]` 比较解析后的整数和原始字符串，在 Lua 中永远不相等，导致所有条件写入失败。
+- 2026-10-21 的结论「Lua 脚本 ETag 比较永不相等、条件写总失败」**是错的**，已据此撤回 `writeIndex` 的无条件写。
+- 2026-10-22 实测根因（daprd 1.18.7 + redis:7，HTTP 与 gRPC 对照）：Go SDK `SaveStateWithETag` 不传选项时用默认 `CONCURRENCY_LAST_WRITE`，last-write 下 Redis 组件忽略 ETag；而以 first-write 创建的键带 `first-write` 字段，之后**不带 ETag 的写（含显式 last-write）一律 `failed to set key`**，带 ETag + first-write 模式则正常，过期 ETag 返回 409/Aborted。
+- 做法：`daprStore` 的 ETag 写 / 删显式 `dapr.WithConcurrency(StateConcurrencyFirstWrite)`；普通 `Set` 遇 `failed to set key` 时回读 ETag 再条件写（Worker 的 `worker:*:attempt:*` 是 first-write 创建、之后多次覆盖写，正是这里踩坑：现象为 SubmitAttempt 报 `save attempt ... user_script:14`）。`internal/store/store.go`。
 
-**影响范围**：仅影响 worker 注册索引（`registry:fake:_index`），不影响 actor state 或其他记录写入。
+## Streaming 订阅的 TopicEvent.Data 是解码后的值（2026-10-22）
 
-**修复**：`writeIndex` 改为无条件写入（`Set` without ETag），由 `MutateIndex` 的重试循环提供竞态保护。
+- 现象：`attempt-events` 从未唤醒 Workflow，只能靠 60s 轮询兜底。
+- 原因：`daprCl.SubscribeWithHandler` 对 JSON 内容把 `TopicEvent.Data` 解成 map，旧代码 `event.Data.([]byte)` 断言失败后直接 DROP。
+- 做法：断言失败时用 `event.RawData`（原始字节）。`cmd/mybot-runtime/main.go`。
+
+## 空 token 下 A2A 鉴权 401（2026-10-22）
+
+- 现象：本地无 token 时 SubmitAttempt 一直 401。
+- 原因：客户端发 `Authorization: Bearer `（末尾空格被 HTTP 栈裁掉），服务端比较 `"Bearer "+""` 永不相等。
+- 做法：token 为空时客户端不发头、服务端不校验（与 `--token` 帮助文案「empty = no auth」一致）。`internal/a2a/{client,server}.go`。
+
+## Workflow 内的阻塞与超时语义（2026-10-22）
+
+- `WaitForExternalEvent(name, 0)` 无缓冲事件时立即取消；**负数**超时才是无限等待。旧 `waitForResume` 用 0，pause 后会被当成取消。
+- Workflow 体内不能用 `time.Now()`（旧 `CheckStopConditions` 判截止时间用了它）；改为传入 `ctx.CurrentTimeUTC()`。
+- `RaiseEvent` 的 payload 要传结构体：传 `[]byte` 会被 JSON 编成 base64 字符串，Workflow 解不出 Signal（旧 API 控制信号就是这样丢的，cancel 只靠「queued 直接改投影」碰巧生效）。
 
 ## Cancel while queued 的竞态修复（2026-10-21）
 

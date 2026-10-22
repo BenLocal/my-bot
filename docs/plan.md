@@ -1,7 +1,7 @@
 # my-bot 实施计划
 
 > 2026-10-21 制定，依据 `docs/spec.md`（下文 §x 均指 spec 章节）与流程走查 `docs/flow.md`（F1…F12 为流程，G1…G18 为走查发现的缺口）。spec 是契约，本计划只回答「按什么顺序做、每步怎么验证」。
-> **当前阶段：A 流程定稿与 P0 核验均已完成（2026-10-21），结论已写回 spec；下一步是 M0。尚未开始写正式代码。**实施中发现 spec 有误或缺口，先改 spec 再改代码。
+> **当前阶段：M0 已完成（2026-10-22），T13 验收用例全部在 fake 执行器上通过；下一步是 M1。**实施中发现 spec 有误或缺口，先改 spec 再改代码。
 > 每个任务完成的定义（DoD）：代码过 `gofmt -l . && go vet ./... && go test ./...`；并发相关加跑 `go test -race`；逐条对照 `docs/agents-dot-md/code-checklist.md`；涉及契约变更时 spec 已同步。
 
 ## 总览
@@ -167,6 +167,13 @@ P0 完成标准：上述 6 项结论已写回 spec，spec 中不再有指向 P0 
 | 会话亲和 | F2 / G5 | reuse 会话派回原 Worker；原 Worker 满载超过 `affinityWait` 时换实例并转 `fresh` |
 
 M0 完成标准：上表全部通过，且 `go test -race ./internal/...` 通过。
+
+**状态：✅ 已完成（2026-10-22）**。`make test-e2e`（`go test -tags e2e ./test/e2e/`，每个用例独立 Redis + 独立 Dapr app-id）上表 11 项全部通过，`go test -race ./internal/...` 通过。实现与 spec 的差异及留给后续里程碑的项：
+- 会话亲和「原 Worker 满载超过 `affinityWait` 换实例转 `fresh`」只在 `internal/scheduler` 单测中覆盖，e2e 只验证 reuse 派回原 Worker。
+- cancel 对运行中的 Attempt 发 `CancelAttempt` 后不等其到终态（spec 写的是每个上限 2 分钟），直接释放全部 lease 并结束；终态以 Worker 记录为准。
+- Goal 级 `check`（`RunCheck`）与 `CommitMemories` 仍是占位，归 M1 的 T14 / T18；`kind=loop` 创建返回 400，归 T17。
+- Runtime 停机期间发布的 `attempt-events` 不保证送达，重启后靠 60s `PollAttempt` 兜底（§12.4 用例约 60s 完成）。
+- 本地联调：`scripts/dev/dev.sh` / `stop.sh`（只停自己记录的进程组）；排查 e2e 时设 `MYBOT_E2E_LOGDIR=<dir>` 保留各进程日志。
 
 ---
 
