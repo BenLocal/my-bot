@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -81,6 +82,24 @@ type Script struct {
 	RecoverPhase executor.Phase `json:"recoverPhase,omitempty"`
 	// RecoverReason 是 Recover 返回的原因，用于区分 interrupted 的两种判据。
 	RecoverReason string `json:"recoverReason,omitempty"`
+
+	// ByRound 按轮次（十进制字符串）覆盖脚本，命中时整体替换顶层字段。
+	ByRound map[string]Script `json:"byRound,omitempty"`
+	// ByWorker 按 Worker ID 覆盖脚本，优先级高于 ByRound。
+	ByWorker map[string]Script `json:"byWorker,omitempty"`
+}
+
+// Resolve 按 byWorker[workerID] > byRound[round] > 顶层字段 选出生效脚本。
+// 返回的脚本不再带 ByRound / ByWorker。
+func (s Script) Resolve(workerID string, round int) Script {
+	out := s
+	if w, ok := s.ByWorker[workerID]; ok && workerID != "" {
+		out = w
+	} else if r, ok := s.ByRound[strconv.Itoa(round)]; ok {
+		out = r
+	}
+	out.ByRound, out.ByWorker = nil, nil
+	return out
 }
 
 // ArtifactSpec 是产物文件的脚本描述。
@@ -98,6 +117,7 @@ type Fake struct {
 	defaultScript Script
 	scripts       map[string]Script
 	artifactRoot  string
+	workerID      string
 	handles       map[executor.Handle]*fakeHandle
 	seq           int
 }
@@ -112,13 +132,19 @@ type fakeHandle struct {
 // Option 配置 Fake。
 type Option func(*Fake)
 
-// WithArtifactRoot 指定产物写入目录；缺省用 os.TempDir()/mybot-fake-artifacts。
+// WithArtifactRoot 指定共享产物根目录；缺省用 os.TempDir()/mybot-artifacts。
+// 产物写到 <root>/<goalID>/r<round>/<stepID>/<name>（spec §7.1）。
 func WithArtifactRoot(dir string) Option {
 	return func(f *Fake) {
 		if dir != "" {
 			f.artifactRoot = dir
 		}
 	}
+}
+
+// WithWorkerID 指定本 Worker ID，用于脚本的 byWorker 选择。
+func WithWorkerID(id string) Option {
+	return func(f *Fake) { f.workerID = id }
 }
 
 // WithDefaultScript 指定默认脚本（未按 attemptKey 覆盖时使用）。
@@ -131,7 +157,7 @@ func New(opts ...Option) *Fake {
 	f := &Fake{
 		scripts:      map[string]Script{},
 		handles:      map[executor.Handle]*fakeHandle{},
-		artifactRoot: filepath.Join(os.TempDir(), "mybot-fake-artifacts"),
+		artifactRoot: filepath.Join(os.TempDir(), "mybot-artifacts"),
 	}
 	for _, opt := range opts {
 		opt(f)
@@ -172,9 +198,33 @@ func (f *Fake) scriptFor(attemptKey string) Script {
 	return f.defaultScript
 }
 
-// Start 按脚本启动一次异步执行。
+// selectScript 选出一次 Attempt 的生效脚本：按 attemptKey 覆盖（测试钩子）>
+// 提示中最后一个 ```fake-script 块 > 默认脚本；再按 Resolve 规则选 byWorker / byRound。
+func (f *Fake) selectScript(req executor.StartReq) (Script, error) {
+	f.mu.Lock()
+	s, ok := f.scripts[req.AttemptKey]
+	if !ok {
+		s = f.defaultScript
+	}
+	workerID := f.workerID
+	f.mu.Unlock()
+	if !ok {
+		if raw := lastFencedBlock(req.Instruction); raw != "" {
+			if err := json.Unmarshal([]byte(raw), &s); err != nil {
+				return Script{}, fmt.Errorf("fake: parse prompt fake-script: %w", err)
+			}
+		}
+	}
+	return s.Resolve(workerID, req.Round), nil
+}
+
+// Start 按脚本启动一次异步执行。提示中的 fake-script 解析失败时，本次 Attempt
+// 以不可重试的 failed(bad_request) 结束。
 func (f *Fake) Start(ctx context.Context, req executor.StartReq) (executor.Handle, error) {
-	script := f.scriptFor(req.AttemptKey)
+	script, err := f.selectScript(req)
+	if err != nil {
+		script = Script{Fail: true, Reason: "bad_request", Result: err.Error()}
+	}
 
 	f.mu.Lock()
 	f.seq++
@@ -274,12 +324,15 @@ func (f *Fake) run(ctx context.Context, eh *fakeHandle, req executor.StartReq, s
 }
 
 func (f *Fake) writeArtifacts(req executor.StartReq, specs []ArtifactSpec) ([]executor.Artifact, error) {
-	dir := filepath.Join(f.artifactRoot, req.AttemptKey)
+	dir := filepath.Join(f.artifactRoot, req.GoalID, fmt.Sprintf("r%d", req.Round), req.StepID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create artifact dir: %w", err)
 	}
 	out := make([]executor.Artifact, 0, len(specs))
 	for _, spec := range specs {
+		if spec.Name == "" || spec.Name != filepath.Base(spec.Name) || spec.Name == ".." {
+			return nil, fmt.Errorf("invalid artifact name %q", spec.Name)
+		}
 		path := filepath.Join(dir, spec.Name)
 		if err := os.WriteFile(path, []byte(spec.Content), 0o644); err != nil {
 			return nil, fmt.Errorf("write artifact %s: %w", spec.Name, err)
@@ -355,7 +408,10 @@ func (f *Fake) Cancel(ctx context.Context, h executor.Handle) error {
 
 // Recover 按 attemptKey 的脚本模拟 spec §7.2 的四种判据。
 func (f *Fake) Recover(ctx context.Context, rec executor.AttemptRecord) (executor.Status, error) {
-	s := f.scriptFor(rec.AttemptKey)
+	f.mu.Lock()
+	workerID := f.workerID
+	f.mu.Unlock()
+	s := f.scriptFor(rec.AttemptKey).Resolve(workerID, rec.Round)
 	phase := s.RecoverPhase
 	if phase == "" {
 		phase = executor.PhaseInterrupted
@@ -397,6 +453,18 @@ func LoadScriptFile(path string) (Script, error) {
 }
 
 func extractFakeScript(text string) string {
+	if raw := lastFencedBlock(text); raw != "" {
+		return raw
+	}
+	trimmed := strings.TrimSpace(text)
+	if json.Valid([]byte(trimmed)) {
+		return trimmed
+	}
+	return ""
+}
+
+// lastFencedBlock 返回文本中最后一个 ```fake-script（或 ```fake）围栏块的内容。
+func lastFencedBlock(text string) string {
 	lines := strings.Split(text, "\n")
 	var current []string
 	var blocks []string
@@ -422,10 +490,6 @@ func extractFakeScript(text string) string {
 	}
 	if len(blocks) > 0 {
 		return strings.TrimSpace(blocks[len(blocks)-1])
-	}
-	trimmed := strings.TrimSpace(text)
-	if json.Valid([]byte(trimmed)) {
-		return trimmed
 	}
 	return ""
 }

@@ -18,7 +18,34 @@ const (
 	MetaSessionPolicy = "mybot/sessionPolicy"
 	MetaInputs        = "mybot/inputs"
 	MetaTraceparent   = "mybot/traceparent"
+	MetaRole          = "mybot/role"
+	MetaStepID        = "mybot/stepID"
 )
+
+// Worker 写在返回 Task.Metadata 上的结果键（spec §7.1、§7.2）。
+const (
+	// MetaAttemptStatus 的值是 core.AttemptStatus 字符串。
+	MetaAttemptStatus = "mybot/attemptStatus"
+	// MetaReason 是失败原因（auth_required、rate_limited、timeout、driver_bug、crashed 等）。
+	MetaReason = "mybot/reason"
+	// MetaRetryable 是失败是否可重试（bool）。
+	MetaRetryable = "mybot/retryable"
+	// MetaUsage 是本次 Attempt 的增量用量，JSON 形如 core.Usage（{inputTokens, outputTokens}）。
+	MetaUsage = "mybot/usage"
+)
+
+// Worker 写在每个 Task Artifact.Metadata 上的产物键；Artifact.Name 为文件名。
+const (
+	// MetaArtifactURI 形如 mybot-artifact://<goalID>/r<round>/<stepID>/<name>。
+	MetaArtifactURI = "mybot/uri"
+	// MetaArtifactPath 是共享产物目录上的绝对路径。
+	MetaArtifactPath   = "mybot/path"
+	MetaArtifactSha256 = "mybot/sha256"
+	MetaArtifactSize   = "mybot/size"
+)
+
+// ArtifactURIScheme 是产物 URI 的前缀。
+const ArtifactURIScheme = "mybot-artifact://"
 
 // SessionPolicy 控制一次 Attempt 对执行器会话的复用策略。
 type SessionPolicy string
@@ -40,6 +67,10 @@ type Metadata struct {
 	SessionPolicy SessionPolicy
 	Inputs        []string
 	Traceparent   string
+	// Role 是本 Step 的角色名，用于派生 reuse 会话 ID。
+	Role string
+	// StepID 是本 Step 在轮内的 ID，用于产物路径。
+	StepID string
 }
 
 // EncodeMetadata 把 Metadata 写入请求级 metadata 容器并返回该容器。
@@ -69,6 +100,12 @@ func EncodeMetadata(m map[string]any, meta Metadata) map[string]any {
 	if meta.Traceparent != "" {
 		m[MetaTraceparent] = meta.Traceparent
 	}
+	if meta.Role != "" {
+		m[MetaRole] = meta.Role
+	}
+	if meta.StepID != "" {
+		m[MetaStepID] = meta.StepID
+	}
 	return m
 }
 
@@ -84,6 +121,8 @@ func DecodeMetadata(m map[string]any) (Metadata, error) {
 	meta.GoalID = asString(m[MetaGoalID])
 	meta.Workspace = asString(m[MetaWorkspace])
 	meta.Traceparent = asString(m[MetaTraceparent])
+	meta.Role = asString(m[MetaRole])
+	meta.StepID = asString(m[MetaStepID])
 	meta.SessionPolicy = SessionPolicy(asString(m[MetaSessionPolicy]))
 
 	if v, ok := m[MetaRound]; ok {

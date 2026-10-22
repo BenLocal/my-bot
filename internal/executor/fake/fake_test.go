@@ -132,7 +132,7 @@ func TestFakeScriptable(t *testing.T) {
 		f := NewWithScript(Script{
 			Artifacts: []ArtifactSpec{{Name: "report.md", Content: content}},
 		}, WithArtifactRoot(root))
-		h, _ := f.Start(ctx, executor.StartReq{AttemptKey: "a6"})
+		h, _ := f.Start(ctx, executor.StartReq{AttemptKey: "a6", GoalID: "g1", Round: 2, StepID: "s2:dev:1"})
 		evs, _ := drain(f.Events(h), time.Second)
 		if len(evs) != 2 || evs[0].Type != executor.EventArtifact || evs[1].Type != executor.EventTerminal {
 			t.Fatalf("expected artifact then terminal, got %d events: %+v", len(evs), evs)
@@ -140,6 +140,9 @@ func TestFakeScriptable(t *testing.T) {
 		art := evs[0].Artifacts[0]
 		if art.Name != "report.md" || art.Sha256 != core.HashSHA256([]byte(content)) || art.Size != int64(len(content)) {
 			t.Fatalf("unexpected artifact: %+v", art)
+		}
+		if want := filepath.Join(root, "g1", "r2", "s2:dev:1", "report.md"); art.Path != want {
+			t.Fatalf("artifact path = %s, want %s", art.Path, want)
 		}
 		if _, err := os.Stat(art.Path); err != nil {
 			t.Fatalf("artifact file missing: %v", err)
@@ -256,5 +259,88 @@ func TestLoadScriptFile(t *testing.T) {
 	}
 	if time.Duration(s.Delay) != 30*time.Millisecond || s.Repeats != 2 {
 		t.Fatalf("unexpected: %+v", s)
+	}
+}
+
+func TestScriptResolve(t *testing.T) {
+	s := Script{
+		Result: "top",
+		ByRound: map[string]Script{
+			"2": {Result: "round2"},
+		},
+		ByWorker: map[string]Script{
+			"w-hang": {Hang: true},
+		},
+	}
+	cases := []struct {
+		name     string
+		worker   string
+		round    int
+		wantRes  string
+		wantHang bool
+	}{
+		{"top level", "w1", 1, "top", false},
+		{"by round", "w1", 2, "round2", false},
+		{"by worker beats by round", "w-hang", 2, "", true},
+		{"empty worker id ignores byWorker", "", 1, "top", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := s.Resolve(c.worker, c.round)
+			if got.Result != c.wantRes || got.Hang != c.wantHang {
+				t.Fatalf("Resolve(%q,%d) = %+v", c.worker, c.round, got)
+			}
+			if got.ByRound != nil || got.ByWorker != nil {
+				t.Fatalf("resolved script should drop overrides: %+v", got)
+			}
+		})
+	}
+}
+
+func TestSelectScriptFromPrompt(t *testing.T) {
+	ctx := context.Background()
+	prompt := "[objective]\n```fake-script\n{\"result\":\"first\"}\n```\n" +
+		"more\n```fake-script\n{\"result\":\"r1\",\"byRound\":{\"2\":{\"result\":\"r2\"}},\"byWorker\":{\"wx\":{\"result\":\"wx\"}}}\n```\n"
+
+	run := func(f *Fake, req executor.StartReq) executor.Event {
+		t.Helper()
+		h, err := f.Start(ctx, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		evs, closed := drain(f.Events(h), time.Second)
+		if !closed || len(evs) == 0 {
+			t.Fatalf("no terminal event: %+v", evs)
+		}
+		return evs[len(evs)-1]
+	}
+
+	f := NewWithScript(Script{Result: "default"}, WithWorkerID("w1"))
+	if ev := run(f, executor.StartReq{AttemptKey: "k1", Round: 1, Instruction: prompt}); ev.Text != "r1" {
+		t.Fatalf("round1 from last prompt block: got %q", ev.Text)
+	}
+	if ev := run(f, executor.StartReq{AttemptKey: "k2", Round: 2, Instruction: prompt}); ev.Text != "r2" {
+		t.Fatalf("round2 byRound: got %q", ev.Text)
+	}
+	if ev := run(f, executor.StartReq{AttemptKey: "k3", Round: 1, Instruction: "no block"}); ev.Text != "default" {
+		t.Fatalf("default script: got %q", ev.Text)
+	}
+
+	fx := NewWithScript(Script{Result: "default"}, WithWorkerID("wx"))
+	if ev := run(fx, executor.StartReq{AttemptKey: "k4", Round: 2, Instruction: prompt}); ev.Text != "wx" {
+		t.Fatalf("byWorker: got %q", ev.Text)
+	}
+
+	// 默认脚本里的 byRound 同样生效。
+	fd := NewWithScript(Script{Result: "d1", ByRound: map[string]Script{"3": {Result: "d3"}}})
+	if ev := run(fd, executor.StartReq{AttemptKey: "k5", Round: 3}); ev.Text != "d3" {
+		t.Fatalf("default byRound: got %q", ev.Text)
+	}
+
+	// 提示中的脚本非法时以不可重试失败结束。
+	bad := "```fake-script\n{not json\n```"
+	ev := run(f, executor.StartReq{AttemptKey: "k6", Round: 1, Instruction: bad})
+	if ev.Phase != executor.PhaseFailed || ev.Retryable || ev.Reason != "bad_request" {
+		t.Fatalf("bad prompt script: %+v", ev)
 	}
 }

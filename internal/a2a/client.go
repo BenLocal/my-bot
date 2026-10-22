@@ -115,6 +115,8 @@ type bearerInterceptor struct {
 }
 
 func (b *bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (context.Context, any, error) {
-	req.ServiceParams["Authorization"] = []string{"Bearer " + b.token}
+	if b.token != "" {
+		req.ServiceParams["Authorization"] = []string{"Bearer " + b.token}
+	}
 	return ctx, nil, nil
 }

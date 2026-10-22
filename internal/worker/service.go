@@ -9,6 +9,10 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"maps"
+	"path"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,7 +26,6 @@ import (
 	"github.com/BenLocal/my-bot/internal/store"
 
 	daprclient "github.com/dapr/go-sdk/client"
-	"github.com/google/uuid"
 )
 
 // attemptEventsTopic is the pub/sub topic for terminal attempt notifications
@@ -54,6 +57,10 @@ type Service struct {
 	pubsub   PubSubPublisher
 	logger   *slog.Logger
 
+	// indexMu 串行化本进程对 attempt 索引的修改：store.MutateIndex 当前是
+	// 无条件写（见 store/index.go），同进程并发修改会互相覆盖。
+	indexMu sync.Mutex
+
 	draining atomic.Bool
 	inflight sync.WaitGroup
 }
@@ -62,8 +69,18 @@ type taskEntry struct {
 	task       *a2ago.Task
 	attemptKey string
 	goalID     string
+	round      int
+	stepID     string
+	role       string
 	sessionID  string
-	events     chan executor.Event
+	events     chan a2ago.Event
+	artifacts  []core.ArtifactRef
+
+	// cancelRequested 在 Cancel 调用 driver.Cancel 前置位，使「事件通道无终态
+	// 关闭」被识别为取消而不是 driver_bug。
+	cancelRequested bool
+	// finalized 表示终态已被认领（首个调用 finish 者生效）。
+	finalized bool
 }
 
 // Option configures a Service.
@@ -89,6 +106,15 @@ func WithPubSub(p PubSubPublisher) Option {
 	return func(s *Service) { s.pubsub = p }
 }
 
+// WithLogger sets the logger.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *Service) {
+		if l != nil {
+			s.logger = l
+		}
+	}
+}
+
 // NewService creates a new worker service with a fake driver.
 func NewService(opts ...Option) *Service {
 	s := &Service{
@@ -111,6 +137,11 @@ func (s *Service) SetDriver(d *fake.Fake) {
 	s.mu.Unlock()
 }
 
+// attemptIndexKey 是本 Worker 非终态 attempt 的索引键，供重启后 Recover 扫描。
+func attemptIndexKey(workerID string) string {
+	return "worker:" + workerID + ":attempts:_index"
+}
+
 // Submit starts an attempt using the fake driver.
 func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.Message, info a2ago.TaskInfo) (a2a.SubmitResult, error) {
 	if s.draining.Load() {
@@ -127,11 +158,15 @@ func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.
 
 	// Storage-backed first-write dedup (§7.2 step 1, §6). The session ID is
 	// decided before execution and persisted with the record (§7.2 step 2).
-	sessionID := s.sessionIDFor(meta)
+	sessionID := sessionIDFor(meta)
 	if s.store != nil {
 		rec := store.AttemptRecord{
 			SessionID: sessionID,
 			Status:    core.AttemptSubmitting,
+			GoalID:    meta.GoalID,
+			Round:     meta.Round,
+			StepID:    meta.StepID,
+			Role:      meta.Role,
 		}
 		created, err := store.CreateAttempt(ctx, s.store, s.workerID, meta.AttemptKey, rec)
 		if err != nil {
@@ -139,28 +174,23 @@ func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.
 			return a2a.SubmitResult{}, fmt.Errorf("worker: create attempt: %w", err)
 		}
 		if !created {
-			// Owner-matched retry ("write succeeded but response was lost").
-			// The record is already in the store; return the in-memory task when
-			// present, otherwise the full task body is no longer available.
-			if _, lerr := store.LoadAttempt(ctx, s.store, s.workerID, meta.AttemptKey); lerr != nil {
-				s.mu.Unlock()
-				return a2a.SubmitResult{}, fmt.Errorf("worker: load existing attempt: %w", lerr)
-			}
-			if entry, ok := s.byKey[meta.AttemptKey]; ok {
-				s.mu.Unlock()
-				return s.submitResult(entry), nil
-			}
+			// Owner-matched retry ("write succeeded but response was lost"). The
+			// record exists but this process has no live entry for it (e.g. after
+			// a restart); callers reconcile via GetByAttemptKey instead.
 			s.mu.Unlock()
 			return a2a.SubmitResult{}, fmt.Errorf("worker: attempt %q already exists for worker %q", meta.AttemptKey, s.workerID)
+		}
+		// 先写记录、再进索引（§6）。索引写失败只影响重启后的 Recover，不阻断执行。
+		if err := s.addToIndex(ctx, meta.AttemptKey); err != nil {
+			s.logger.Error("worker: add attempt index", "error", err, "attemptKey", meta.AttemptKey)
 		}
 	}
 
 	// Create a submitted task.
 	task := a2ago.NewSubmittedTask(info, message)
 	task.Metadata = a2a.EncodeMetadata(task.Metadata, meta)
+	task.Metadata = a2a.EncodeResultMeta(task.Metadata, core.AttemptSubmitted, "", false, core.Usage{})
 
-	// Build the StartReq for the fake driver.
-	instruction := extractInstruction(message)
 	sessionPolicy := executor.SessionPolicy(meta.SessionPolicy)
 	if meta.SessionPolicy == "" {
 		sessionPolicy = executor.SessionPolicyFresh
@@ -170,9 +200,9 @@ func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.
 		AttemptKey:    meta.AttemptKey,
 		GoalID:        meta.GoalID,
 		Round:         meta.Round,
-		StepID:        "step",
-		Role:          "role",
-		Instruction:   instruction,
+		StepID:        meta.StepID,
+		Role:          meta.Role,
+		Instruction:   extractInstruction(message),
 		SessionPolicy: sessionPolicy,
 		SessionID:     sessionID,
 		Workspace:     meta.Workspace,
@@ -184,6 +214,10 @@ func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.
 			SessionID:    sessionID,
 			RemoteTaskID: string(task.ID),
 			Status:       core.AttemptSubmitted,
+			GoalID:       meta.GoalID,
+			Round:        meta.Round,
+			StepID:       meta.StepID,
+			Role:         meta.Role,
 		}
 		if err := store.SaveAttempt(ctx, s.store, s.workerID, meta.AttemptKey, rec); err != nil {
 			s.mu.Unlock()
@@ -191,20 +225,21 @@ func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.
 		}
 	}
 
-	// Start the fake driver.
 	handle, err := s.driver.Start(ctx, startReq)
 	if err != nil {
 		s.mu.Unlock()
 		return a2a.SubmitResult{}, fmt.Errorf("worker: start driver: %w", err)
 	}
 
-	// Store the task entry.
 	entry := &taskEntry{
 		task:       task,
 		attemptKey: meta.AttemptKey,
 		goalID:     meta.GoalID,
+		round:      meta.Round,
+		stepID:     meta.StepID,
+		role:       meta.Role,
 		sessionID:  sessionID,
-		events:     make(chan executor.Event, 16),
+		events:     make(chan a2ago.Event, 64),
 	}
 	s.tasks[task.ID] = entry
 	s.byKey[meta.AttemptKey] = entry
@@ -212,8 +247,8 @@ func (s *Service) Submit(ctx context.Context, meta a2a.Metadata, message *a2ago.
 	s.inflight.Add(1)
 	s.mu.Unlock()
 
-	// Start a goroutine to consume driver events and update task status.
-	go s.consumeEvents(ctx, task.ID, handle)
+	// Execution outlives the request: consumeEvents detaches cancellation.
+	go s.consumeEvents(ctx, entry, handle)
 
 	return s.submitResult(entry), nil
 }
@@ -224,11 +259,12 @@ func (s *Service) submitResult(entry *taskEntry) a2a.SubmitResult {
 	s.mu.Unlock()
 	return a2a.SubmitResult{
 		Task:   task,
-		Handle: handleFromEntry(s, entry),
+		Handle: &fakeHandle{svc: s, taskID: task.ID},
 	}
 }
 
-// Get returns a task by ID.
+// Get returns a task by ID. Only attempts started by this process are known;
+// after a restart callers use GetByAttemptKey.
 func (s *Service) Get(ctx context.Context, taskID a2ago.TaskID) (*a2ago.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -236,42 +272,57 @@ func (s *Service) Get(ctx context.Context, taskID a2ago.TaskID) (*a2ago.Task, er
 	if !ok {
 		return nil, a2ago.ErrTaskNotFound
 	}
-	// Return a copy to avoid data races.
 	return copyTask(entry.task), nil
 }
 
-// GetByAttemptKey returns a task by attempt key.
+// GetByAttemptKey returns a task by attempt key, falling back to the stored
+// attempt record when this process has no live entry (e.g. after a restart).
 func (s *Service) GetByAttemptKey(ctx context.Context, attemptKey string) (*a2ago.Task, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	entry, ok := s.byKey[attemptKey]
-	if !ok {
+	var task *a2ago.Task
+	if ok {
+		task = copyTask(entry.task)
+	}
+	s.mu.Unlock()
+	if ok {
+		return task, nil
+	}
+	if s.store == nil {
 		return nil, a2ago.ErrTaskNotFound
 	}
-	return copyTask(entry.task), nil
+	rec, err := store.LoadAttempt(ctx, s.store, s.workerID, attemptKey)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, a2ago.ErrTaskNotFound
+		}
+		return nil, fmt.Errorf("worker: load attempt %q: %w", attemptKey, err)
+	}
+	return taskFromRecord(rec), nil
 }
 
-// Cancel cancels an attempt.
+// Cancel cancels an attempt; the attempt ends as cancelled. Cancelling an
+// attempt that already reached a terminal state is a no-op.
 func (s *Service) Cancel(ctx context.Context, taskID a2ago.TaskID) error {
 	s.mu.Lock()
 	handle, ok := s.handles[taskID]
-	entry, okEntry := s.tasks[taskID]
-	s.mu.Unlock()
-
-	if !ok {
+	entry := s.tasks[taskID]
+	if !ok || entry == nil {
+		s.mu.Unlock()
 		return a2ago.ErrTaskNotFound
 	}
+	if entry.finalized {
+		s.mu.Unlock()
+		return nil
+	}
+	entry.cancelRequested = true
+	s.mu.Unlock()
 
 	if err := s.driver.Cancel(ctx, handle); err != nil {
-		return fmt.Errorf("worker: cancel driver: %w", err)
+		// 句柄可能已结束；取消语义仍以记录为准。
+		s.logger.Warn("worker: driver cancel", "error", err, "taskID", taskID)
 	}
-
-	if okEntry {
-		s.mu.Lock()
-		entry.task.Status.State = a2ago.TaskStateCanceled
-		s.mu.Unlock()
-	}
-
+	s.finish(context.WithoutCancel(ctx), entry, core.AttemptCancelled, "", false, "", core.Usage{})
 	return nil
 }
 
@@ -283,9 +334,8 @@ func (s *Service) Subscribe(ctx context.Context, taskID a2ago.TaskID) iter.Seq2[
 }
 
 // streamEvents yields a task (when includeTask is true) followed by its
-// subsequent driver events. It is shared by Subscribe and the a2a.Handle
-// returned from Submit so both the direct API and HTTP streaming observe the
-// same events.
+// subsequent events. It is shared by Subscribe and the a2a.Handle returned
+// from Submit so both the direct API and HTTP streaming observe the same events.
 func (s *Service) streamEvents(ctx context.Context, taskID a2ago.TaskID, includeTask bool, yield func(a2ago.Event, error) bool) {
 	s.mu.Lock()
 	entry, ok := s.tasks[taskID]
@@ -306,147 +356,197 @@ func (s *Service) streamEvents(ctx context.Context, taskID a2ago.TaskID, include
 		}
 	}
 
-	// Stream events from the per-task broadcast channel. The background
-	// consumeEvents goroutine is the sole reader of the driver channel.
 	for ev := range entry.events {
-		a2aEvent, err := s.convertEvent(ctx, taskID, ev)
-		if err != nil {
-			yield(nil, err)
-			return
-		}
-		if a2aEvent == nil {
-			continue
-		}
-		if !yield(a2aEvent, nil) {
+		if !yield(ev, nil) {
 			return
 		}
 	}
 }
 
-// consumeEvents reads driver events and updates task status. It is the sole
-// reader of the driver event channel; Subscribe consumes the broadcast channel
-// attached to the task entry instead, so the two never race on the driver
-// channel.
-func (s *Service) consumeEvents(ctx context.Context, taskID a2ago.TaskID, handle executor.Handle) {
-	defer s.inflight.Done()
-
-	s.mu.Lock()
-	entry := s.tasks[taskID]
-	s.mu.Unlock()
-	if entry == nil {
-		return
+// broadcast forwards an event to the stream consumer; dropped if the buffer is
+// full (streaming is display-only, §7.1).
+func broadcast(entry *taskEntry, ev a2ago.Event) {
+	select {
+	case entry.events <- ev:
+	default:
 	}
+}
+
+// consumeEvents is the sole reader of the driver event channel. It updates the
+// task, finalizes the attempt and closes the per-task event channel.
+func (s *Service) consumeEvents(ctx context.Context, entry *taskEntry, handle executor.Handle) {
+	defer s.inflight.Done()
+	defer close(entry.events)
 
 	// Terminal persistence and pub/sub must not be tied to the request-scoped
-	// context, which is canceled once the HTTP response returns. Detach
-	// cancellation while preserving values for the terminal write.
+	// context, which is canceled once the HTTP response returns.
 	termCtx := context.WithoutCancel(ctx)
+	info := entry.task.TaskInfo()
 
-	events := s.driver.Events(handle)
 	var terminalEv executor.Event
 	terminalReceived := false
-	for ev := range events {
-		// Broadcast to any SSE subscriber; drop if none is reading.
-		select {
-		case entry.events <- ev:
-		default:
-		}
-		if ev.Type == executor.EventTerminal {
+	for ev := range s.driver.Events(handle) {
+		switch ev.Type {
+		case executor.EventProgress:
+			msg := a2ago.NewMessage(a2ago.MessageRoleAgent, a2ago.NewTextPart(ev.Text))
+			up := a2ago.NewStatusUpdateEvent(info, a2ago.TaskStateWorking, msg)
+			s.mu.Lock()
+			if !entry.finalized {
+				entry.task.Status.State = a2ago.TaskStateWorking
+				entry.task.Metadata = cloneMeta(entry.task.Metadata)
+				entry.task.Metadata[a2a.MetaAttemptStatus] = string(core.AttemptWorking)
+			}
+			s.mu.Unlock()
+			up.Metadata = map[string]any{a2a.MetaAttemptStatus: string(core.AttemptWorking)}
+			broadcast(entry, up)
+		case executor.EventArtifact:
+			for _, art := range ev.Artifacts {
+				a2aArt := a2a.NewArtifact(entry.goalID, entry.round, entry.stepID, art.Name, art.Path, art.Sha256, art.Size)
+				ref := core.ArtifactRef{
+					Path:   a2a.ArtifactRelPath(entry.round, entry.stepID, art.Name),
+					Sha256: art.Sha256,
+					Size:   art.Size,
+					Round:  entry.round,
+				}
+				s.mu.Lock()
+				entry.task.Artifacts = append(entry.task.Artifacts, a2aArt)
+				entry.artifacts = append(entry.artifacts, ref)
+				s.mu.Unlock()
+				ae := &a2ago.TaskArtifactUpdateEvent{
+					TaskID:    info.TaskID,
+					ContextID: info.ContextID,
+					Artifact:  a2aArt,
+					LastChunk: true,
+				}
+				broadcast(entry, ae)
+			}
+		case executor.EventTerminal:
 			terminalEv = ev
 			terminalReceived = true
+		}
+		if terminalReceived {
 			break
 		}
 	}
-	close(entry.events)
 
-	if terminalReceived {
-		s.handleTerminal(termCtx, taskID, terminalEv)
-	} else {
-		// The driver closed the channel without a terminal event: driver bug.
-		s.handleDriverBug(termCtx, taskID)
+	s.mu.Lock()
+	cancelled := entry.cancelRequested
+	s.mu.Unlock()
+
+	switch {
+	case terminalReceived:
+		status := mapPhaseToAttemptStatus(terminalEv.Phase)
+		if ev, ok := s.finish(termCtx, entry, status, terminalEv.Reason, terminalEv.Retryable, terminalEv.Text, terminalEv.Usage); ok {
+			broadcast(entry, ev)
+		}
+	case cancelled:
+		// SDK 的取消流程自己写入 CANCELED，这里不再推送事件。
+		s.finish(termCtx, entry, core.AttemptCancelled, "", false, "", core.Usage{})
+	default:
+		// The driver closed the channel without a terminal event: driver bug (§7.2).
+		if ev, ok := s.finish(termCtx, entry, core.AttemptFailed, "driver_bug", false,
+			"driver bug: events closed without terminal event", core.Usage{}); ok {
+			broadcast(entry, ev)
+		}
 	}
 }
 
-// handleTerminal persists the terminal record and publishes attempt-events.
-func (s *Service) handleTerminal(ctx context.Context, taskID a2ago.TaskID, ev executor.Event) {
-	phase := ev.Phase
-	status := mapPhaseToAttemptStatus(phase)
+// finish claims the terminal state for an attempt (first caller wins), updates
+// the in-memory task, persists the record, drops it from the attempt index and
+// publishes attempt-events. It returns the terminal status-update event for the
+// stream and whether this call performed the finalization.
+func (s *Service) finish(ctx context.Context, entry *taskEntry, status core.AttemptStatus, reason string, retryable bool, text string, usage core.Usage) (a2ago.Event, bool) {
+	state := attemptStatusToState(status)
+	var msg *a2ago.Message
+	if text != "" {
+		msg = a2ago.NewMessage(a2ago.MessageRoleAgent, a2ago.NewTextPart(text))
+	}
 
 	s.mu.Lock()
-	entry := s.tasks[taskID]
-	if entry != nil {
-		entry.task.Status.State = mapPhaseToState(phase)
-		if ev.Text != "" {
-			entry.task.Status.Message = a2ago.NewMessage(a2ago.MessageRoleAgent,
-				a2ago.NewTextPart(ev.Text))
-		}
+	if entry.finalized {
+		s.mu.Unlock()
+		return nil, false
 	}
-	goalID, attemptKey, sessionID := "", "", ""
-	if entry != nil {
-		goalID, attemptKey, sessionID = entry.goalID, entry.attemptKey, entry.sessionID
-	}
+	entry.finalized = true
+	entry.task.Status = a2ago.TaskStatus{State: state, Message: msg}
+	entry.task.Metadata = a2a.EncodeResultMeta(cloneMeta(entry.task.Metadata), status, reason, retryable, usage)
+	artifacts := append([]core.ArtifactRef(nil), entry.artifacts...)
+	info := entry.task.TaskInfo()
 	s.mu.Unlock()
+
+	ev := a2ago.NewStatusUpdateEvent(info, state, msg)
+	ev.Metadata = a2a.EncodeResultMeta(nil, status, reason, retryable, usage)
 
 	if s.store != nil {
 		rec := store.AttemptRecord{
-			SessionID:    sessionID,
-			RemoteTaskID: string(taskID),
+			SessionID:    entry.sessionID,
+			RemoteTaskID: string(info.TaskID),
 			Status:       status,
-			Usage:        ev.Usage,
+			Usage:        usage,
+			Artifacts:    artifacts,
+			GoalID:       entry.goalID,
+			Round:        entry.round,
+			StepID:       entry.stepID,
+			Role:         entry.role,
+			Reason:       reason,
+			Retryable:    retryable,
+			Text:         text,
 		}
-		if err := store.SaveAttempt(ctx, s.store, s.workerID, attemptKey, rec); err != nil {
+		if err := store.SaveAttempt(ctx, s.store, s.workerID, entry.attemptKey, rec); err != nil {
 			s.logger.Error("worker: save terminal attempt record",
-				"error", err, "attemptKey", attemptKey, "taskID", taskID)
+				"error", err, "attemptKey", entry.attemptKey, "taskID", info.TaskID)
+		} else if isTerminalAttemptStatus(status) {
+			if err := s.removeFromIndex(ctx, entry.attemptKey); err != nil {
+				s.logger.Error("worker: remove attempt index", "error", err, "attemptKey", entry.attemptKey)
+			}
 		}
 	}
 
-	s.publishAttemptEvent(ctx, attemptKey, goalID, status)
+	s.publishAttemptEvent(ctx, entry.attemptKey, entry.goalID, status)
 
 	s.logger.Info("worker: attempt terminal",
-		"attemptKey", attemptKey,
-		"taskID", taskID,
-		"phase", phase,
-		"retryable", ev.Retryable,
+		"attemptKey", entry.attemptKey,
+		"taskID", info.TaskID,
+		"status", status,
+		"reason", reason,
+		"retryable", retryable,
 	)
+	return ev, true
 }
 
-// handleDriverBug marks an attempt failed when the driver closes events without
-// a terminal event (docs/spec.md §7.2).
-func (s *Service) handleDriverBug(ctx context.Context, taskID a2ago.TaskID) {
-	s.mu.Lock()
-	entry := s.tasks[taskID]
-	alreadyTerminal := entry != nil && entry.task.Status.State.Terminal()
-	if entry != nil && !alreadyTerminal {
-		entry.task.Status.State = a2ago.TaskStateFailed
-		entry.task.Status.Message = a2ago.NewMessage(a2ago.MessageRoleAgent,
-			a2ago.NewTextPart("driver bug: events closed without terminal event"))
-	}
-	goalID, attemptKey, sessionID := "", "", ""
-	if entry != nil {
-		goalID, attemptKey, sessionID = entry.goalID, entry.attemptKey, entry.sessionID
-	}
-	s.mu.Unlock()
-
-	if alreadyTerminal {
-		return
-	}
-
-	if s.store != nil {
-		rec := store.AttemptRecord{
-			SessionID:    sessionID,
-			RemoteTaskID: string(taskID),
-			Status:       core.AttemptFailed,
+// addToIndex adds attemptKey to this worker's attempt index.
+func (s *Service) addToIndex(ctx context.Context, attemptKey string) error {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	return store.MutateIndex(ctx, s.store, attemptIndexKey(s.workerID), func(ids []string) ([]string, bool) {
+		if slices.Contains(ids, attemptKey) {
+			return ids, false
 		}
-		if err := store.SaveAttempt(ctx, s.store, s.workerID, attemptKey, rec); err != nil {
-			s.logger.Error("worker: save driver-bug attempt record",
-				"error", err, "attemptKey", attemptKey, "taskID", taskID)
+		return append(ids, attemptKey), true
+	})
+}
+
+// removeFromIndex removes attemptKey from this worker's attempt index.
+func (s *Service) removeFromIndex(ctx context.Context, attemptKey string) error {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	return store.MutateIndex(ctx, s.store, attemptIndexKey(s.workerID), func(ids []string) ([]string, bool) {
+		i := slices.Index(ids, attemptKey)
+		if i < 0 {
+			return ids, false
 		}
-	}
+		return slices.Delete(ids, i, i+1), true
+	})
+}
 
-	s.publishAttemptEvent(ctx, attemptKey, goalID, core.AttemptFailed)
-
-	s.logger.Warn("worker: attempt closed without terminal event",
-		"attemptKey", attemptKey, "taskID", taskID)
+// listIndex returns the attempt keys currently in this worker's index.
+func (s *Service) listIndex(ctx context.Context) ([]string, error) {
+	var keys []string
+	err := store.MutateIndex(ctx, s.store, attemptIndexKey(s.workerID), func(ids []string) ([]string, bool) {
+		keys = append([]string(nil), ids...)
+		return ids, false
+	})
+	return keys, err
 }
 
 // publishAttemptEvent publishes a terminal attempt-events notification.
@@ -469,30 +569,45 @@ func (s *Service) publishAttemptEvent(ctx context.Context, attemptKey, goalID st
 	}
 }
 
-// convertEvent converts a driver event to an a2a event.
-func (s *Service) convertEvent(ctx context.Context, taskID a2ago.TaskID, ev executor.Event) (a2ago.Event, error) {
-	taskInfo := a2ago.TaskInfo{TaskID: taskID}
-
-	switch ev.Type {
-	case executor.EventProgress:
-		msg := a2ago.NewMessage(a2ago.MessageRoleAgent, a2ago.NewTextPart(ev.Text))
-		return a2ago.NewStatusUpdateEvent(taskInfo, a2ago.TaskStateWorking, msg), nil
-
-	case executor.EventArtifact:
-		parts := make([]*a2ago.Part, 0, len(ev.Artifacts))
-		for _, art := range ev.Artifacts {
-			parts = append(parts, a2ago.NewTextPart(art.Path))
-		}
-		return a2ago.NewArtifactEvent(taskInfo, parts...), nil
-
-	case executor.EventTerminal:
-		state := mapPhaseToState(ev.Phase)
-		msg := a2ago.NewMessage(a2ago.MessageRoleAgent, a2ago.NewTextPart(ev.Text))
-		return a2ago.NewStatusUpdateEvent(taskInfo, state, msg), nil
-
-	default:
-		return nil, nil
+// taskFromRecord synthesizes a Task from a stored attempt record (used after a
+// restart). The context ID and absolute artifact paths are not persisted and
+// are absent.
+func taskFromRecord(rec store.AttemptRecord) *a2ago.Task {
+	meta := map[string]any{a2a.MetaAttemptKey: rec.Key}
+	if rec.GoalID != "" {
+		meta[a2a.MetaGoalID] = rec.GoalID
 	}
+	if rec.Round != 0 {
+		meta[a2a.MetaRound] = rec.Round
+	}
+	if rec.StepID != "" {
+		meta[a2a.MetaStepID] = rec.StepID
+	}
+	if rec.Role != "" {
+		meta[a2a.MetaRole] = rec.Role
+	}
+	task := &a2ago.Task{
+		ID:       a2ago.TaskID(rec.RemoteTaskID),
+		Status:   a2ago.TaskStatus{State: attemptStatusToState(rec.Status)},
+		Metadata: a2a.EncodeResultMeta(meta, rec.Status, rec.Reason, rec.Retryable, rec.Usage),
+	}
+	if rec.Text != "" {
+		task.Status.Message = a2ago.NewMessage(a2ago.MessageRoleAgent, a2ago.NewTextPart(rec.Text))
+	}
+	for _, ref := range rec.Artifacts {
+		uri := a2a.ArtifactURIScheme + rec.GoalID + "/" + ref.Path
+		task.Artifacts = append(task.Artifacts, &a2ago.Artifact{
+			ID:    a2ago.NewArtifactID(),
+			Name:  path.Base(ref.Path),
+			Parts: []*a2ago.Part{a2ago.NewTextPart(uri)},
+			Metadata: map[string]any{
+				a2a.MetaArtifactURI:    uri,
+				a2a.MetaArtifactSha256: ref.Sha256,
+				a2a.MetaArtifactSize:   ref.Size,
+			},
+		})
+	}
+	return task
 }
 
 // Drain stops accepting new attempts.
@@ -515,34 +630,51 @@ func (s *Service) WaitInflight(ctx context.Context) error {
 	}
 }
 
-// sessionIDFor derives the session ID for an attempt (§7.2 step 2). The fake
-// driver does not truly manage sessions; reuse is simplified to an empty ID.
-func (s *Service) sessionIDFor(meta a2a.Metadata) string {
+// sessionIDFor derives the session ID for an attempt (§7.2 step 2): reuse →
+// uuid5(goalID + ":" + role); fresh → uuid5(attemptKey).
+func sessionIDFor(meta a2a.Metadata) string {
 	if meta.SessionPolicy == a2a.SessionPolicyReuse {
-		return ""
+		return core.SessionID(meta.GoalID, meta.Role)
 	}
-	return uuid.NewSHA1(uuid.NameSpaceDNS, []byte(meta.AttemptKey)).String()
+	return core.SessionIDFresh(meta.AttemptKey)
 }
 
-// extractInstruction extracts the instruction text from the message.
+// extractInstruction joins all text parts of the message.
 func extractInstruction(msg *a2ago.Message) string {
-	if msg == nil || len(msg.Parts) == 0 {
+	if msg == nil {
 		return ""
 	}
-	return msg.Parts[0].Text()
+	var texts []string
+	for _, p := range msg.Parts {
+		if p == nil {
+			continue
+		}
+		if t := p.Text(); t != "" {
+			texts = append(texts, t)
+		}
+	}
+	return strings.Join(texts, "\n")
 }
 
-// mapPhaseToState maps an executor phase to an a2a task state.
-func mapPhaseToState(phase executor.Phase) a2ago.TaskState {
-	switch phase {
-	case executor.PhaseCompleted:
-		return a2ago.TaskStateCompleted
-	case executor.PhaseFailed:
-		return a2ago.TaskStateFailed
-	case executor.PhasePaused:
-		return a2ago.TaskStateInputRequired
-	default:
+// attemptStatusToState maps an attempt status to an a2a task state. interrupted
+// has no A2A equivalent and maps to FAILED; the precise status travels in
+// MetaAttemptStatus.
+func attemptStatusToState(status core.AttemptStatus) a2ago.TaskState {
+	switch status {
+	case core.AttemptSubmitting, core.AttemptSubmitted:
+		return a2ago.TaskStateSubmitted
+	case core.AttemptWorking:
 		return a2ago.TaskStateWorking
+	case core.AttemptCompleted:
+		return a2ago.TaskStateCompleted
+	case core.AttemptFailed, core.AttemptInterrupted:
+		return a2ago.TaskStateFailed
+	case core.AttemptRejected:
+		return a2ago.TaskStateRejected
+	case core.AttemptCancelled:
+		return a2ago.TaskStateCanceled
+	default:
+		return a2ago.TaskStateUnspecified
 	}
 }
 
@@ -564,7 +696,16 @@ func mapPhaseToAttemptStatus(phase executor.Phase) core.AttemptStatus {
 	}
 }
 
-// copyTask returns a shallow copy of a task to avoid data races.
+// cloneMeta returns a shallow copy of a metadata map (never nil). Values stored
+// in metadata are treated as immutable, so a top-level copy is enough.
+func cloneMeta(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m)+4)
+	maps.Copy(out, m)
+	return out
+}
+
+// copyTask returns a copy of a task that is safe to hand out while the entry
+// keeps being updated under s.mu.
 func copyTask(t *a2ago.Task) *a2ago.Task {
 	if t == nil {
 		return nil
@@ -573,6 +714,9 @@ func copyTask(t *a2ago.Task) *a2ago.Task {
 	if t.Status.Message != nil {
 		msg := *t.Status.Message
 		cp.Status.Message = &msg
+	}
+	if t.Metadata != nil {
+		cp.Metadata = cloneMeta(t.Metadata)
 	}
 	cp.Artifacts = make([]*a2ago.Artifact, len(t.Artifacts))
 	for i, art := range t.Artifacts {
@@ -614,11 +758,6 @@ func (h *fakeHandle) Cancel(ctx context.Context) error {
 		return nil
 	}
 	return h.svc.Cancel(ctx, h.taskID)
-}
-
-// handleFromEntry creates a Handle from a task entry.
-func handleFromEntry(s *Service, entry *taskEntry) a2a.Handle {
-	return &fakeHandle{svc: s, taskID: entry.task.ID}
 }
 
 // daprPublisher publishes through a Dapr sidecar.

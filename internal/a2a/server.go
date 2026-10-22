@@ -11,6 +11,8 @@ import (
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
+
+	"github.com/BenLocal/my-bot/internal/core"
 )
 
 // Worker 是 Worker 侧提供给 a2a.Server 的内部执行契约。
@@ -131,7 +133,9 @@ func (e *executor) Cancel(ctx context.Context, ec *a2asrv.ExecutorContext) iter.
 			yield(nil, err)
 			return
 		}
-		yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil), nil)
+		ev := a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCanceled, nil)
+		ev.Metadata = EncodeResultMeta(nil, core.AttemptCancelled, "", false, core.Usage{})
+		yield(ev, nil)
 	}
 }
 
@@ -167,6 +171,16 @@ func (h *dedupeHandler) SendMessage(ctx context.Context, req *a2a.SendMessageReq
 	return h.RequestHandler.SendMessage(ctx, req)
 }
 
+// CancelTask 对已到终态（非取消）的 Task 视为空操作，直接返回该 Task；
+// SDK 默认对此返回 ErrTaskNotCancelable。
+func (h *dedupeHandler) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) (*a2a.Task, error) {
+	if task, err := h.RequestHandler.GetTask(ctx, &a2a.GetTaskRequest{ID: req.ID}); err == nil &&
+		task.Status.State.Terminal() && task.Status.State != a2a.TaskStateCanceled {
+		return task, nil
+	}
+	return h.RequestHandler.CancelTask(ctx, req)
+}
+
 // authInterceptor 在服务端校验 Bearer token，并设置已认证用户。
 type authInterceptor struct {
 	a2asrv.PassthroughCallInterceptor
@@ -174,6 +188,10 @@ type authInterceptor struct {
 }
 
 func (a authInterceptor) Before(ctx context.Context, cc *a2asrv.CallContext, req *a2asrv.Request) (context.Context, any, error) {
+	if a.token == "" { // 空 token = 不鉴权（本地开发）
+		cc.User = a2asrv.NewAuthenticatedUser("mybot-runtime", nil)
+		return ctx, nil, nil
+	}
 	if v, ok := cc.ServiceParams().Get("Authorization"); ok && len(v) > 0 && v[0] == "Bearer "+a.token {
 		cc.User = a2asrv.NewAuthenticatedUser("mybot-runtime", nil)
 		return ctx, nil, nil
@@ -183,6 +201,9 @@ func (a authInterceptor) Before(ctx context.Context, cc *a2asrv.CallContext, req
 
 // bearerMiddleware 在 HTTP 层校验 Bearer token，缺失或错误时返回 401。
 func bearerMiddleware(token string, next http.Handler) http.Handler {
+	if token == "" { // 空 token = 不鉴权（本地开发）
+		return next
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			w.Header().Set("WWW-Authenticate", "Bearer")
