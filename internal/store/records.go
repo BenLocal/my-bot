@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"time"
 
 	"github.com/BenLocal/my-bot/internal/core"
@@ -211,6 +213,13 @@ type AttemptRecord struct {
 	Status       core.AttemptStatus `json:"status"`
 	Usage        core.Usage         `json:"usage,omitempty"`
 	Artifacts    []core.ArtifactRef `json:"artifacts,omitempty"`
+	GoalID       string             `json:"goalID,omitempty"`
+	Round        int                `json:"round,omitempty"`
+	StepID       string             `json:"stepID,omitempty"`
+	Role         string             `json:"role,omitempty"`
+	Reason       string             `json:"reason,omitempty"`
+	Retryable    bool               `json:"retryable,omitempty"`
+	Text         string             `json:"text,omitempty"` // 终态结果正文（重启后供 GetByAttemptKey 返回）
 	UpdatedAt    time.Time          `json:"updatedAt"`
 }
 
@@ -311,6 +320,82 @@ func RemoveRegistryIndex(ctx context.Context, s Store, executor, workerID string
 	})
 }
 
+// roundKey builds the state key for a round summary.
+func roundKey(goalID string, round int) string {
+	return fmt.Sprintf("goal:%s:round:%d", goalID, round)
+}
+
+// roundIndexKey builds the index key listing all rounds for a goal.
+func roundIndexKey(goalID string) string {
+	return "goal:" + goalID + ":rounds"
+}
+
+// SaveRoundSummary persists a round summary for later retrieval by the API.
+func SaveRoundSummary(ctx context.Context, s Store, goalID string, rs core.RoundSummary) error {
+	data, err := json.Marshal(rs)
+	if err != nil {
+		return err
+	}
+	if err := s.Set(ctx, roundKey(goalID, rs.Round), data, ""); err != nil {
+		return err
+	}
+	return MutateIndex(ctx, s, roundIndexKey(goalID), func(ids []string) ([]string, bool) {
+		for _, id := range ids {
+			if fmt.Sprintf("%d", rs.Round) == id {
+				return ids, false
+			}
+		}
+		return append(ids, fmt.Sprintf("%d", rs.Round)), true
+	})
+}
+
+// LoadRoundSummary reads a round summary by round number.
+func LoadRoundSummary(ctx context.Context, s Store, goalID string, round int) (core.RoundSummary, error) {
+	item, err := s.Get(ctx, roundKey(goalID, round))
+	if err != nil {
+		return core.RoundSummary{}, err
+	}
+	var rs core.RoundSummary
+	if err := json.Unmarshal(item.Value, &rs); err != nil {
+		return core.RoundSummary{}, err
+	}
+	return rs, nil
+}
+
+// ListRoundSummaries returns all round summaries for a goal, sorted by round number.
+func ListRoundSummaries(ctx context.Context, s Store, goalID string) ([]core.RoundSummary, error) {
+	var roundIDs []string
+	err := MutateIndex(ctx, s, roundIndexKey(goalID), func(existing []string) ([]string, bool) {
+		roundIDs = existing
+		return existing, false
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Parse round numbers and sort.
+	rounds := make([]int, 0, len(roundIDs))
+	for _, id := range roundIDs {
+		n, err := strconv.Atoi(id)
+		if err != nil {
+			continue
+		}
+		rounds = append(rounds, n)
+	}
+	sort.Ints(rounds)
+	summaries := make([]core.RoundSummary, 0, len(rounds))
+	for _, n := range rounds {
+		rs, err := LoadRoundSummary(ctx, s, goalID, n)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		summaries = append(summaries, rs)
+	}
+	return summaries, nil
+}
+
 // SaveArtifact registers an artifact under
 // goal:<id>:artifact:r<round>/<stepID>/<name>.
 func SaveArtifact(ctx context.Context, s Store, goalID string, round int, stepID, name string, ref core.ArtifactRef) error {
@@ -332,4 +417,76 @@ func LoadArtifact(ctx context.Context, s Store, goalID string, round int, stepID
 		return core.ArtifactRef{}, err
 	}
 	return ref, nil
+}
+
+// AddGoalToIndexes adds a goal to goal:_index:active and goal:_index:all (spec §6).
+func AddGoalToIndexes(ctx context.Context, s Store, goalID string) error {
+	for _, key := range []string{goalActiveIndexKey(), goalAllIndexKey()} {
+		if err := MutateIndex(ctx, s, key, addID(goalID)); err != nil {
+			return fmt.Errorf("add goal %s to %s: %w", goalID, key, err)
+		}
+	}
+	return nil
+}
+
+// MoveGoalToFinished removes a goal from the active index (it stays in _index:all).
+func MoveGoalToFinished(ctx context.Context, s Store, goalID string) error {
+	return MutateIndex(ctx, s, goalActiveIndexKey(), func(ids []string) ([]string, bool) {
+		out := ids[:0:0]
+		for _, id := range ids {
+			if id != goalID {
+				out = append(out, id)
+			}
+		}
+		return out, len(out) != len(ids)
+	})
+}
+
+// ListGoalIDs returns the active (activeOnly) or all goal IDs.
+func ListGoalIDs(ctx context.Context, s Store, activeOnly bool) ([]string, error) {
+	key := goalAllIndexKey()
+	if activeOnly {
+		key = goalActiveIndexKey()
+	}
+	var ids []string
+	err := MutateIndex(ctx, s, key, func(existing []string) ([]string, bool) {
+		ids = existing
+		return existing, false
+	})
+	return ids, err
+}
+
+func addID(id string) func([]string) ([]string, bool) {
+	return func(ids []string) ([]string, bool) {
+		for _, x := range ids {
+			if x == id {
+				return ids, false
+			}
+		}
+		return append(ids, id), true
+	}
+}
+
+func goalSpecKey(goalID string) string { return "goal:" + goalID + ":spec" }
+
+// SaveGoalSpec stores the frozen spec so a crashed creation can be re-scheduled (flow G1).
+func SaveGoalSpec(ctx context.Context, s Store, goalID string, spec core.GoalSpec) error {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
+	return s.Set(ctx, goalSpecKey(goalID), data, "")
+}
+
+// LoadGoalSpec reads the frozen spec written by SaveGoalSpec.
+func LoadGoalSpec(ctx context.Context, s Store, goalID string) (core.GoalSpec, error) {
+	item, err := s.Get(ctx, goalSpecKey(goalID))
+	if err != nil {
+		return core.GoalSpec{}, err
+	}
+	var spec core.GoalSpec
+	if err := json.Unmarshal(item.Value, &spec); err != nil {
+		return core.GoalSpec{}, err
+	}
+	return spec, nil
 }

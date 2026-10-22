@@ -94,9 +94,28 @@ func (s *daprStore) Get(ctx context.Context, key string) (*Item, error) {
 
 func (s *daprStore) Set(ctx context.Context, key string, value []byte, etag string) error {
 	if etag != "" {
-		return s.client.SaveStateWithETag(ctx, s.storeName, key, value, etag, nil)
+		return s.saveWithETag(ctx, key, value, etag)
 	}
-	return s.client.SaveState(ctx, s.storeName, key, value, nil)
+	err := s.client.SaveState(ctx, s.storeName, key, value, nil)
+	// Redis 上以 first-write 创建的键会留下 first-write 标记，之后不带 ETag 的写入
+	// 一律被 Lua 脚本拒绝（"failed to set key"，last-write 也一样；2026-10-22 实测）。
+	// 此时回读 ETag 再条件写，语义仍是 last-write。
+	for i := 0; i < 3 && err != nil && strings.Contains(err.Error(), "failed to set key"); i++ {
+		item, gerr := s.Get(ctx, key)
+		if gerr != nil {
+			return fmt.Errorf("set %s: re-read etag: %w", key, gerr)
+		}
+		err = s.saveWithETag(ctx, key, value, item.ETag)
+	}
+	return err
+}
+
+// saveWithETag performs a conditional write. The concurrency mode must be
+// first-write: the SDK defaults to last-write, under which the Redis store
+// ignores the ETag (and rejects keys created by first-write) — 2026-10-22 实测。
+func (s *daprStore) saveWithETag(ctx context.Context, key string, value []byte, etag string) error {
+	return s.client.SaveStateWithETag(ctx, s.storeName, key, value, etag, nil,
+		dapr.WithConcurrency(dapr.StateConcurrencyFirstWrite))
 }
 
 func (s *daprStore) SetTTL(ctx context.Context, key string, value []byte, ttl time.Duration) error {
@@ -111,7 +130,7 @@ func (s *daprStore) SetTTL(ctx context.Context, key string, value []byte, ttl ti
 func (s *daprStore) Delete(ctx context.Context, key string, etag string) error {
 	if etag != "" {
 		return s.client.DeleteStateWithETag(ctx, s.storeName, key,
-			&dapr.ETag{Value: etag}, nil, nil)
+			&dapr.ETag{Value: etag}, nil, &dapr.StateOptions{Concurrency: dapr.StateConcurrencyFirstWrite})
 	}
 	return s.client.DeleteState(ctx, s.storeName, key, nil)
 }
